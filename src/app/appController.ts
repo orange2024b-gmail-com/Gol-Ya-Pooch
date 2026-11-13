@@ -78,6 +78,7 @@ export class GolYaPoochApp {
   private fps = 0;
   private inferenceMs = 0;
   private lastFrameTs = 0;
+  private lastDebugRenderTs = 0;
   private rafId: number | null = null;
   private replayTimerId: number | null = null;
   private replayActive = false;
@@ -224,6 +225,19 @@ export class GolYaPoochApp {
         this.stabilityPassed = false;
         this.stabilityProgress = 0;
       }
+      this.renderUi();
+      return;
+    }
+
+    if (event.type === 'TICK') {
+      this.updateDynamicFieldsInPlace();
+      if (this.shouldShowCameraStage()) {
+        this.updateLiveOverlay();
+      }
+      if (this.showDebug && performance.now() - this.lastDebugRenderTs > 200) {
+        this.updateDebugMetricsInPlace();
+      }
+      return;
     }
 
     this.renderUi();
@@ -403,10 +417,10 @@ export class GolYaPoochApp {
       // Refresh calibration status & debug view smoothly without spamming FSM
       this.updateLiveOverlay();
       if (this.ctx.state === 'CALIBRATION') {
-        this.renderCalibrationChecklistOnly();
+        this.updateDynamicFieldsInPlace();
       }
-      if (this.showDebug) {
-        this.renderDebugPanel();
+      if (this.showDebug && performance.now() - this.lastDebugRenderTs > 200) {
+        this.updateDebugMetricsInPlace();
       }
     }
   }
@@ -574,11 +588,61 @@ export class GolYaPoochApp {
     );
   }
 
-  private renderCalibrationChecklistOnly(): void {
-    const list = this.panelContainer.querySelector('[data-cal-checklist]');
-    if (!list) return;
-    // Re-render panel cleanly if calibration checklist is active
-    this.renderPanel();
+  private updateDynamicFieldsInPlace(): void {
+    const timerEl = this.panelContainer.querySelector('[data-hud-timer]');
+    if (timerEl) {
+      timerEl.textContent = formatSecondsFa(this.ctx.phaseRemainingMs);
+    }
+
+    const pinchEl = this.panelContainer.querySelector('[data-pinch-progress]');
+    if (pinchEl) {
+      const framesDone = this.lastPinchState?.consecutiveFrames ?? 0;
+      const framesReq = this.lastPinchState?.requiredFrames ?? 15;
+      pinchEl.textContent = `تثبیت پینچ: ${toPersianDigits(framesDone)} از ${toPersianDigits(framesReq)} فریم پیاپی`;
+    }
+
+    if (this.ctx.state === 'CALIBRATION') {
+      const q = this.lastQuality;
+      this.updateCheckItemInPlace('lighting', Boolean(q?.lightingOk), q?.lightingHintFa ?? null);
+      this.updateCheckItemInPlace(
+        'hands',
+        this.stabilityPassed,
+        this.stabilityPassed
+          ? 'هر دو دست با اطمینان کافی تثبیت شدند.'
+          : `پیشرفت پایداری: ${toPersianDigits(Math.round(this.stabilityProgress * 100))}٪`
+      );
+      this.updateCheckItemInPlace('distance', Boolean(q?.distanceOk), q?.distanceHintFa ?? null);
+      this.updateCheckItemInPlace(
+        'gol',
+        this.golColorModel !== null,
+        this.golColorModel
+          ? `مدل رنگ ثبت شد (${toPersianDigits(this.golColorModel.sampleCount)} نمونه پیکسل).`
+          : FA.calGolInstruction
+      );
+
+      const doneBtn = this.panelContainer.querySelector<HTMLButtonElement>(
+        '[data-testid="calibration-done-btn"]'
+      );
+      if (doneBtn) {
+        doneBtn.disabled = !this.isCalibrationReady();
+      }
+    }
+  }
+
+  private updateCheckItemInPlace(key: string, ok: boolean, hint: string | null): void {
+    const li = this.panelContainer.querySelector<HTMLElement>(`[data-cal-key="${key}"]`);
+    if (!li) return;
+    li.className = `check-item ${ok ? 'ok' : 'fail'}`;
+    const badge = li.querySelector<HTMLElement>('[data-cal-status]');
+    if (badge) {
+      badge.className = `check-status ${ok ? 'ok' : 'pending'}`;
+      badge.textContent = ok ? 'تأیید ✓' : 'در انتظار…';
+    }
+    const hintEl = li.querySelector<HTMLElement>('[data-cal-hint]');
+    if (hintEl) {
+      hintEl.textContent = hint ?? '';
+      hintEl.classList.toggle('hidden', !hint);
+    }
   }
 
   private renderUi(): void {
@@ -704,36 +768,38 @@ export class GolYaPoochApp {
         list.className = 'checklist';
         list.setAttribute('data-cal-checklist', 'true');
 
-        const addCheck = (label: string, ok: boolean, hint?: string | null) => {
+        const addCheck = (key: string, label: string, ok: boolean, hint?: string | null) => {
           const li = document.createElement('li');
           li.className = `check-item ${ok ? 'ok' : 'fail'}`;
+          li.setAttribute('data-cal-key', key);
           const left = document.createElement('div');
           const title = document.createElement('div');
           title.textContent = label;
-          left.append(title);
-          if (hint) {
-            const p = document.createElement('p');
-            p.className = 'check-hint';
-            p.textContent = hint;
-            left.append(p);
-          }
+          const p = document.createElement('p');
+          p.className = `check-hint${hint ? '' : ' hidden'}`;
+          p.setAttribute('data-cal-hint', 'true');
+          p.textContent = hint ?? '';
+          left.append(title, p);
           const badge = document.createElement('span');
           badge.className = `check-status ${ok ? 'ok' : 'pending'}`;
+          badge.setAttribute('data-cal-status', 'true');
           badge.textContent = ok ? 'تأیید ✓' : 'در انتظار…';
           li.append(left, badge);
           list.append(li);
         };
 
-        addCheck(FA.calCheckLighting, Boolean(q?.lightingOk), q?.lightingHintFa);
+        addCheck('lighting', FA.calCheckLighting, Boolean(q?.lightingOk), q?.lightingHintFa);
         addCheck(
+          'hands',
           FA.calCheckHands,
           this.stabilityPassed,
           this.stabilityPassed
             ? 'هر دو دست با اطمینان کافی تثبیت شدند.'
             : `پیشرفت پایداری: ${toPersianDigits(Math.round(this.stabilityProgress * 100))}٪`
         );
-        addCheck(FA.calCheckDistance, Boolean(q?.distanceOk), q?.distanceHintFa);
+        addCheck('distance', FA.calCheckDistance, Boolean(q?.distanceOk), q?.distanceHintFa);
         addCheck(
+          'gol',
           FA.calCheckGolColor,
           this.golColorModel !== null,
           this.golColorModel
@@ -857,6 +923,7 @@ export class GolYaPoochApp {
           const h2 = document.createElement('h2');
           h2.textContent = FA.showGolPrompt;
           const p = document.createElement('p');
+          p.setAttribute('data-pinch-progress', 'true');
           const framesDone = this.lastPinchState?.consecutiveFrames ?? 0;
           const framesReq = this.lastPinchState?.requiredFrames ?? 15;
           p.textContent = `تثبیت پینچ: ${toPersianDigits(framesDone)} از ${toPersianDigits(framesReq)} فریم پیاپی`;
@@ -1037,7 +1104,7 @@ export class GolYaPoochApp {
     const row = document.createElement('div');
     row.className = 'hud-row';
 
-    const makeStat = (label: string, val: string) => {
+    const makeStat = (label: string, val: string, isTimer = false) => {
       const box = document.createElement('div');
       box.className = 'hud-stat';
       const l = document.createElement('div');
@@ -1045,6 +1112,7 @@ export class GolYaPoochApp {
       l.textContent = label;
       const v = document.createElement('div');
       v.className = 'hud-stat-value';
+      if (isTimer) v.setAttribute('data-hud-timer', 'true');
       v.textContent = val;
       box.append(l, v);
       return box;
@@ -1052,7 +1120,7 @@ export class GolYaPoochApp {
 
     row.append(
       makeStat('امتیاز شما', toPersianDigits(this.ctx.humanScore)),
-      makeStat('زمان مرحله', formatSecondsFa(this.ctx.phaseRemainingMs)),
+      makeStat('زمان مرحله', formatSecondsFa(this.ctx.phaseRemainingMs), true),
       makeStat('امتیاز رایانه', toPersianDigits(this.ctx.computerScore))
     );
     return row;
@@ -1075,9 +1143,52 @@ export class GolYaPoochApp {
     return row;
   }
 
+  private getDebugMetricValues(): Array<[string, string]> {
+    return [
+      ['FSM State', this.ctx.state],
+      ['FPS / Infer', `${this.fps.toFixed(1)} fps / ${this.inferenceMs.toFixed(1)} ms`],
+      [
+        'Left Hand',
+        this.lastHands?.left.detected
+          ? `OK (lost:${this.lastHands.left.lostFrames}, conf:${this.lastHands.left.confidence.toFixed(2)})`
+          : `LOST (${this.lastHands?.left.lostFrames ?? 0}, occ:${Boolean(this.lastHands?.left.occluded)})`,
+      ],
+      [
+        'Right Hand',
+        this.lastHands?.right.detected
+          ? `OK (lost:${this.lastHands.right.lostFrames}, conf:${this.lastHands.right.confidence.toFixed(2)})`
+          : `LOST (${this.lastHands?.right.lostFrames ?? 0}, occ:${Boolean(this.lastHands?.right.occluded)})`,
+      ],
+      [
+        'Lighting / Blur',
+        this.lastQuality
+          ? `L=${this.lastQuality.meanLuminance.toFixed(0)} S=${this.lastQuality.contrastStd.toFixed(0)} B=${this.lastQuality.blurScore.toFixed(0)}`
+          : 'N/A',
+      ],
+      [
+        'Recorder',
+        `${this.recorder.isRecording ? 'REC' : 'IDLE'} (${this.recorder.frameCount} frames)`,
+      ],
+    ];
+  }
+
+  private updateDebugMetricsInPlace(): void {
+    this.lastDebugRenderTs = performance.now();
+    const metrics = this.getDebugMetricValues();
+    for (const [label, value] of metrics) {
+      const el = this.debugContainer.querySelector<HTMLElement>(
+        `[data-debug-metric="${label}"]`
+      );
+      if (el) {
+        el.textContent = value;
+      }
+    }
+  }
+
   private renderDebugPanel(): void {
     this.debugContainer.classList.toggle('hidden', !this.showDebug);
     if (!this.showDebug) return;
+    this.lastDebugRenderTs = performance.now();
 
     this.debugContainer.innerHTML = '';
 
@@ -1087,42 +1198,18 @@ export class GolYaPoochApp {
     const grid = document.createElement('div');
     grid.className = 'debug-grid';
 
-    const addMetric = (label: string, value: string) => {
+    for (const [label, value] of this.getDebugMetricValues()) {
       const box = document.createElement('div');
       box.className = 'debug-metric';
       const s = document.createElement('strong');
       s.textContent = label;
       const v = document.createElement('span');
       v.className = 'ltr-inline';
+      v.setAttribute('data-debug-metric', label);
       v.textContent = value;
       box.append(s, v);
       grid.append(box);
-    };
-
-    addMetric('FSM State', this.ctx.state);
-    addMetric('FPS / Infer', `${this.fps.toFixed(1)} fps / ${this.inferenceMs.toFixed(1)} ms`);
-    addMetric(
-      'Left Hand',
-      this.lastHands?.left.detected
-        ? `OK (lost:${this.lastHands.left.lostFrames}, conf:${this.lastHands.left.confidence.toFixed(2)})`
-        : `LOST (${this.lastHands?.left.lostFrames ?? 0}, occ:${Boolean(this.lastHands?.left.occluded)})`
-    );
-    addMetric(
-      'Right Hand',
-      this.lastHands?.right.detected
-        ? `OK (lost:${this.lastHands.right.lostFrames}, conf:${this.lastHands.right.confidence.toFixed(2)})`
-        : `LOST (${this.lastHands?.right.lostFrames ?? 0}, occ:${Boolean(this.lastHands?.right.occluded)})`
-    );
-    addMetric(
-      'Lighting / Blur',
-      this.lastQuality
-        ? `L=${this.lastQuality.meanLuminance.toFixed(0)} S=${this.lastQuality.contrastStd.toFixed(0)} B=${this.lastQuality.blurScore.toFixed(0)}`
-        : 'N/A'
-    );
-    addMetric(
-      'Recorder',
-      `${this.recorder.isRecording ? 'REC' : 'IDLE'} (${this.recorder.frameCount} frames)`
-    );
+    }
 
     const btnRow = document.createElement('div');
     btnRow.className = 'btn-row';
