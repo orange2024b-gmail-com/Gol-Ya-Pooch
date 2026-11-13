@@ -844,12 +844,21 @@ textarea {
   border-radius: 10px;
   padding: 8px 12px;
   font-size: 0.85rem;
+  min-height: 56px;
 }
 
 .debug-metric strong {
   display: block;
   color: var(--accent-sky);
   font-size: 0.78rem;
+}
+
+.debug-metric span {
+  display: block;
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .ltr-inline {

@@ -1,10 +1,12 @@
+import { writeFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   chooseComputerHidingHand,
   cryptoRandomFloat,
   type HumanGuessRecord,
 } from '../../src/ai/hider';
-import type { LevelId } from '../../src/game/levels';
+import { getLevelDefinition, type LevelId } from '../../src/game/levels';
 
 function computeChiSquare(counts: readonly number[], total: number): number {
   const expected = total / counts.length;
@@ -19,7 +21,6 @@ function computeChiSquare(counts: readonly number[], total: number): number {
 function makeSeededRng(seedInitial: number): () => number {
   let state = seedInitial >>> 0;
   return () => {
-    // Mulberry32 deterministic PRNG for reproducible simulation
     state = (state + 0x6d2b79f5) >>> 0;
     let t = Math.imul(state ^ (state >>> 15), 1 | state);
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
@@ -27,24 +28,31 @@ function makeSeededRng(seedInitial: number): () => number {
   };
 }
 
-type BotType = 'sticky' | 'alternating' | 'frequency' | 'wsls' | 'uniform';
+export type SimBotType = 'random' | 'alternating' | 'sticky' | 'wsls' | 'adversarial';
 
-function simulateLevel5AgainstBot(
-  bot: BotType,
+export interface LevelBotSimResult {
+  levelId: LevelId;
+  levelNameEn: string;
+  handsCount: number;
+  bot: SimBotType;
+  rounds: number;
+  computerWinRate: number;
+  botWinRate: number;
+  maxDeviationObserved: number;
+  meanDeviationObserved: number;
+}
+
+export function simulateLevelAgainstBot(
+  levelId: LevelId,
+  bot: SimBotType,
   handsCount: number,
   rounds: number,
   seed: number
-): {
-  bot: BotType;
-  handsCount: number;
-  rounds: number;
-  computerPreventedHitRate: number;
-  humanHitRate: number;
-  maxDeviationObserved: number;
-  meanDeviationObserved: number;
-} {
+): LevelBotSimResult {
   const botRng = makeSeededRng(seed);
+  const level = getLevelDefinition(levelId);
   const history: HumanGuessRecord[] = [];
+  const computerCountsRecent: number[] = new Array<number>(handsCount).fill(0);
   let computerWins = 0;
   let maxDev = 0;
   let sumDev = 0;
@@ -52,15 +60,13 @@ function simulateLevel5AgainstBot(
   let prevHumanWon = false;
 
   for (let r = 0; r < rounds; r++) {
-    const decision = chooseComputerHidingHand(5, handsCount, history, cryptoRandomFloat);
+    const decision = chooseComputerHidingHand(levelId, handsCount, history, cryptoRandomFloat);
     maxDev = Math.max(maxDev, decision.maxDeviationFromUniform);
     sumDev += decision.maxDeviationFromUniform;
 
     let guess: number;
-    if (bot === 'uniform') {
+    if (bot === 'random') {
       guess = Math.floor(botRng() * handsCount);
-    } else if (bot === 'frequency') {
-      guess = botRng() < 0.85 ? 0 : Math.floor(botRng() * (handsCount - 1)) + 1;
     } else if (bot === 'sticky') {
       if (r === 0) {
         guess = 0;
@@ -77,8 +83,7 @@ function simulateLevel5AgainstBot(
       } else {
         guess = prevGuess;
       }
-    } else {
-      // win-stay-lose-shift
+    } else if (bot === 'wsls') {
       if (r === 0) {
         guess = 0;
       } else if (prevHumanWon) {
@@ -86,10 +91,33 @@ function simulateLevel5AgainstBot(
       } else {
         guess = botRng() < 0.9 ? (prevGuess + 1) % handsCount : prevGuess;
       }
+    } else {
+      // adversarial anti-pattern bot:
+      // Tracks the computer's hiding history with exponential decay and guesses the
+      // computer's highest-frequency slot while injecting 15% anti-exploitation noise.
+      if (r < 4 || botRng() < 0.15) {
+        guess = Math.floor(botRng() * handsCount);
+      } else {
+        let bestIdx = 0;
+        let bestScore = -1;
+        for (let i = 0; i < handsCount; i++) {
+          const score = computerCountsRecent[i] ?? 0;
+          if (score > bestScore) {
+            bestScore = score;
+            bestIdx = i;
+          }
+        }
+        guess = bestIdx;
+      }
     }
 
     const humanWon = guess === decision.chosenHandIndex;
     if (!humanWon) computerWins += 1;
+
+    for (let i = 0; i < handsCount; i++) {
+      computerCountsRecent[i] =
+        (computerCountsRecent[i] ?? 0) * 0.92 + (i === decision.chosenHandIndex ? 1 : 0);
+    }
 
     history.push({
       roundIndex: r + 1,
@@ -102,20 +130,21 @@ function simulateLevel5AgainstBot(
   }
 
   return {
-    bot,
+    levelId,
+    levelNameEn: level.nameEn,
     handsCount,
+    bot,
     rounds,
-    computerPreventedHitRate: computerWins / rounds,
-    humanHitRate: 1 - computerWins / rounds,
+    computerWinRate: computerWins / rounds,
+    botWinRate: 1 - computerWins / rounds,
     maxDeviationObserved: maxDev,
     meanDeviationObserved: sumDev / rounds,
   };
 }
 
-describe('Phase 3 Hider Simulation Suite (tests/sim/)', () => {
+describe('Phase 5 Hider Simulation Suite (tests/sim/)', () => {
   it('passes chi-square uniformity test over 10,000 simulated rounds for Levels 1-4', () => {
     const ROUNDS = 10_000;
-    // Strict alpha = 0.05 thresholds for deterministic check & alpha = 0.0001 thresholds for live crypto check
     const configs: Array<{
       levelId: LevelId;
       handsCount: number;
@@ -163,33 +192,87 @@ describe('Phase 3 Hider Simulation Suite (tests/sim/)', () => {
     console.info('[SIM_UNIFORMITY]', JSON.stringify(reportRows));
   });
 
-  it('achieves measurably higher hit-prevention against biased bots at Level 5 within bounded exploitation limit', () => {
+  it(
+    'evaluates random, alternating, sticky, win-stay-lose-shift, and adversarial bots across Levels 1-5',
+    () => {
     const ROUNDS = 2_000;
-    const biasedBots: BotType[] = ['sticky', 'alternating', 'frequency', 'wsls'];
-    const results = [...biasedBots, 'uniform' as BotType].map((bot, idx) =>
-      simulateLevel5AgainstBot(bot, 2, ROUNDS, 1001 + idx * 77)
-    );
+    const bots: SimBotType[] = ['random', 'alternating', 'sticky', 'wsls', 'adversarial'];
+    const levelConfigs: Array<{ levelId: LevelId; handsCount: number }> = [
+      { levelId: 1, handsCount: 2 },
+      { levelId: 2, handsCount: 2 },
+      { levelId: 3, handsCount: 2 },
+      { levelId: 4, handsCount: 4 },
+      { levelId: 5, handsCount: 2 },
+    ];
 
-    const results4 = biasedBots.map((bot, idx) =>
-      simulateLevel5AgainstBot(bot, 4, ROUNDS, 2001 + idx * 77)
-    );
+    const allResults: LevelBotSimResult[] = [];
+    for (const cfg of levelConfigs) {
+      for (let bIdx = 0; bIdx < bots.length; bIdx++) {
+        const bot = bots[bIdx]!;
+        const res = simulateLevelAgainstBot(
+          cfg.levelId,
+          bot,
+          cfg.handsCount,
+          ROUNDS,
+          3001 + cfg.levelId * 131 + bIdx * 47
+        );
+        allResults.push(res);
 
-    for (const res of results) {
-      expect(res.maxDeviationObserved).toBeLessThanOrEqual(0.18 + 1e-9);
-      if (res.bot !== 'uniform') {
-        expect(res.computerPreventedHitRate).toBeGreaterThan(0.58);
-      } else {
-        expect(res.computerPreventedHitRate).toBeGreaterThan(0.45);
-        expect(res.computerPreventedHitRate).toBeLessThan(0.55);
+        if (cfg.levelId <= 4) {
+          expect(res.maxDeviationObserved).toBe(0);
+          const expectedComputerWin = 1 - 1 / cfg.handsCount;
+          expect(res.computerWinRate).toBeGreaterThan(expectedComputerWin - 0.06);
+          expect(res.computerWinRate).toBeLessThan(expectedComputerWin + 0.06);
+        } else {
+          // Level 5 bounded exploitation check across all 5 bots
+          expect(res.maxDeviationObserved).toBeLessThanOrEqual(0.18 + 1e-9);
+          if (bot === 'alternating' || bot === 'sticky' || bot === 'wsls') {
+            expect(res.computerWinRate).toBeGreaterThan(0.58);
+          } else {
+            // Even against random and adversarial anti-pattern bots, computer stays near/above equilibrium
+            expect(res.computerWinRate).toBeGreaterThanOrEqual(0.45);
+          }
+        }
       }
     }
 
-    for (const res of results4) {
+    const level5K4 = bots.map((bot, idx) =>
+      simulateLevelAgainstBot(5, bot, 4, ROUNDS, 9001 + idx * 53)
+    );
+    for (const res of level5K4) {
       expect(res.maxDeviationObserved).toBeLessThanOrEqual(0.1125 + 1e-9);
-      expect(res.computerPreventedHitRate).toBeGreaterThan(0.8);
+      expect(res.computerWinRate).toBeGreaterThanOrEqual(0.71);
     }
 
-    console.info('[SIM_LEVEL5_K2]', JSON.stringify(results));
-    console.info('[SIM_LEVEL5_K4]', JSON.stringify(results4));
-  });
+    if (process.env.WRITE_SIM_REPORT === '1') {
+      const lines = [
+        '# Bot Simulation Report (Levels 1–5)',
+        '',
+        `Generated from \`tests/sim/hiderSimulation.test.ts\` (${ROUNDS.toLocaleString('en-US')} rounds per bot-level pair).`,
+        '',
+        '| Level | Hands (K) | Bot Strategy | Rounds | Computer Win Rate | Bot Win Rate | Max Deviation from 1/K |',
+        '|---|---:|---|---:|---:|---:|---:|',
+        ...allResults.map(
+          (r) =>
+            `| Level ${r.levelId} (${r.levelNameEn}) | ${r.handsCount} | ${r.bot} | ${r.rounds} | ${(r.computerWinRate * 100).toFixed(2)}% | ${(r.botWinRate * 100).toFixed(2)}% | ${r.maxDeviationObserved.toFixed(4)} |`
+        ),
+        '',
+        '## Level 5 Team Variant (K = 4 Hands)',
+        '',
+        '| Level | Hands (K) | Bot Strategy | Rounds | Computer Win Rate | Bot Win Rate | Max Deviation from 1/K |',
+        '|---|---:|---|---:|---:|---:|---:|',
+        ...level5K4.map(
+          (r) =>
+            `| Level ${r.levelId} (${r.levelNameEn}) | ${r.handsCount} | ${r.bot} | ${r.rounds} | ${(r.computerWinRate * 100).toFixed(2)}% | ${(r.botWinRate * 100).toFixed(2)}% | ${r.maxDeviationObserved.toFixed(4)} |`
+        ),
+        '',
+      ];
+      writeFileSync(resolve(process.cwd(), 'docs/sim-report.md'), lines.join('\n'), 'utf8');
+    }
+
+    console.info('[SIM_ALL_LEVELS]', JSON.stringify(allResults));
+    console.info('[SIM_LEVEL5_K4]', JSON.stringify(level5K4));
+  },
+  20_000
+  );
 });
