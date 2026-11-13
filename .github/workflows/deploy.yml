@@ -37,9 +37,14 @@ jobs:
           npm test
 
       - name: Setup Pages
+        id: pages
         uses: actions/configure-pages@v5
+        with:
+          enablement: true
 
       - name: Build with Vite
+        env:
+          VITE_BASE_PATH: ${{ steps.pages.outputs.base_path || '/Gol-Ya-Pooch/' }}
         run: npm run build
 
       - name: Upload Pages artifact

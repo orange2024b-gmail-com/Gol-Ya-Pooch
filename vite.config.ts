@@ -1,7 +1,12 @@
 import { defineConfig } from 'vite';
 
+function normalizeBase(value: string | undefined): string {
+  if (!value) return './';
+  return value.endsWith('/') ? value : `${value}/`;
+}
+
 export default defineConfig({
-  base: './',
+  base: normalizeBase(process.env.VITE_BASE_PATH),
   build: {
     outDir: 'dist',
     sourcemap: true,
