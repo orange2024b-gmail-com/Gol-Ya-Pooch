@@ -5,6 +5,7 @@ import {
   chooseComputerHidingHand,
   generateHidingChoreography,
 } from '../ai/hider';
+import { ProceduralSoundEngine } from '../audio/soundEngine';
 import { CameraManager, type CameraDeviceSummary } from '../camera/cameraManager';
 import {
   COMMIT_REVEAL_EXPLANATION_FA,
@@ -29,6 +30,17 @@ import {
   RULE_PRESETS,
   type GuessCallType,
 } from '../game/rules/engine';
+import {
+  clearLlmApiKey,
+  generateHostCommentary,
+  generateTemplateCommentary,
+  loadLlmConfig,
+  saveLlmConfig,
+  type CommentaryEvent,
+  type CommentaryResponse,
+  type LlmCommentaryConfig,
+} from '../llm/commentaryClient';
+import { createBrandLogoElement } from '../render/brandLogo';
 import { renderBeliefGraphCanvas, renderVisionOverlay } from '../render/canvasOverlay';
 import { PixiHidingScene } from '../render/pixiHidingScene';
 import { DEFAULT_PROFILE_ID, IndexedDbProfileStore } from '../storage/profileStore';
@@ -86,11 +98,13 @@ import type {
 } from '../vision/types';
 import {
   FA,
+  RULES_BOOK_SECTIONS_FA,
   formatSecondsFa,
   handIndexLabelFa,
   sideLabelFa,
   toPersianDigits,
 } from './i18n';
+import { runDeviceBenchmark, type DeviceBenchmarkReport } from './benchmark';
 
 const CALIBRATION_CIRCLE = { x: 0.5, y: 0.5, radiusNorm: 0.085 };
 
@@ -109,6 +123,13 @@ export class GolYaPoochApp {
   private readonly roundLogStore = new IndexedDbRoundLogStore();
   private readonly temporalModel = new TemporalModelRunner();
   private readonly recorder = new SessionRecorder();
+  private readonly sound = new ProceduralSoundEngine();
+
+  private llmConfig: LlmCommentaryConfig = loadLlmConfig();
+  private llmNoticeFa: string | null = null;
+  private llmNoticeError = false;
+  private lastHostCommentary: CommentaryResponse | null = null;
+  private commentaryRequestSeq = 0;
 
   private progression: PlayerProgressionState = createDefaultProgressionState();
   private consentSettings: ConsentSettings = createDefaultConsentSettings();
@@ -136,11 +157,15 @@ export class GolYaPoochApp {
   private panelContainer!: HTMLElement;
   private debugContainer!: HTMLElement;
   private topbarStatusEl!: HTMLElement;
+  private topbarMuteBtn!: HTMLButtonElement;
 
   private mirrored = true;
   private showLandmarks = true;
   private showDebug = false;
   private reducedMotion = false;
+  private highContrast = false;
+  private benchmarkRunning = false;
+  private benchmarkReport: DeviceBenchmarkReport | null = null;
   private permissionError: string | null = null;
   private cameraDevices: CameraDeviceSummary[] = [];
   private lowFpsDegraded = false;
@@ -180,9 +205,21 @@ export class GolYaPoochApp {
   }
 
   mount(): void {
+    if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+      this.reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    }
     this.buildShell();
     this.bindGlobalListeners();
-    this.renderUi();
+    if (
+      typeof window !== 'undefined' &&
+      new URLSearchParams(window.location.search).get('benchmark') === '1'
+    ) {
+      this.ctx = transitionGameFsm(this.ctx, { type: 'OPEN_BENCHMARK' });
+      this.renderUi();
+      void this.handleRunBenchmark();
+    } else {
+      this.renderUi();
+    }
     void this.loadStoredState();
     void this.initTemporalModel();
   }
@@ -246,9 +283,12 @@ export class GolYaPoochApp {
     const brand = document.createElement('div');
     brand.className = 'brand';
 
-    const mark = document.createElement('div');
-    mark.className = 'brand-mark';
-    mark.textContent = 'گ';
+    const mark = createBrandLogoElement({
+      variant: 'compact',
+      size: 46,
+      idPrefix: 'topbar',
+    });
+    mark.setAttribute('data-testid', 'brand-logo');
 
     const titleWrap = document.createElement('div');
     const title = document.createElement('h1');
@@ -264,16 +304,33 @@ export class GolYaPoochApp {
     actions.className = 'topbar-actions';
 
     this.topbarStatusEl = document.createElement('span');
-    this.topbarStatusEl.className = 'brand-phase';
+    this.topbarStatusEl.className = 'brand-phase tabular-nums';
+
+    this.topbarMuteBtn = document.createElement('button');
+    this.topbarMuteBtn.type = 'button';
+    this.topbarMuteBtn.className = 'btn btn-secondary btn-compact';
+    this.topbarMuteBtn.setAttribute('data-testid', 'topbar-mute-btn');
+    this.topbarMuteBtn.addEventListener('click', () => {
+      const nextMuted = this.sound.toggleMute();
+      if (!nextMuted) this.sound.play('tap');
+      this.updateTopbarMuteButton();
+      if (this.ctx.state === 'MENU') {
+        this.renderPanel();
+      }
+    });
+    this.updateTopbarMuteButton();
 
     const debugBtn = document.createElement('button');
     debugBtn.type = 'button';
     debugBtn.className = 'btn btn-secondary btn-compact';
     debugBtn.textContent = 'دیباگ (D)';
     debugBtn.setAttribute('data-testid', 'toggle-debug-btn');
-    debugBtn.addEventListener('click', () => this.toggleDebug());
+    debugBtn.addEventListener('click', () => {
+      this.sound.play('tap');
+      this.toggleDebug();
+    });
 
-    actions.append(this.topbarStatusEl, debugBtn);
+    actions.append(this.topbarStatusEl, this.topbarMuteBtn, debugBtn);
     topbar.append(brand, actions);
 
     const mainGrid = document.createElement('main');
@@ -304,6 +361,7 @@ export class GolYaPoochApp {
 
     this.stageBannerEl = document.createElement('div');
     this.stageBannerEl.className = 'stage-banner hidden';
+    this.stageBannerEl.setAttribute('aria-live', 'polite');
 
     this.stageContainer.append(this.videoEl, this.overlayCanvas, this.stageBannerEl);
 
@@ -346,8 +404,21 @@ export class GolYaPoochApp {
     });
 
     window.addEventListener('keydown', (ev) => {
+      const tag = (ev.target as HTMLElement | null)?.tagName;
+      if (ev.key === 'Escape') {
+        if (
+          this.ctx.state === 'LEVEL_SELECT' ||
+          this.ctx.state === 'STATS' ||
+          this.ctx.state === 'RULES' ||
+          this.ctx.state === 'CONSENT' ||
+          this.ctx.state === 'BENCHMARK'
+        ) {
+          this.sound.play('tap');
+          this.dispatch({ type: 'EXIT_TO_MENU' });
+        }
+        return;
+      }
       if (ev.key === 'd' || ev.key === 'D' || ev.key === 'د') {
-        const tag = (ev.target as HTMLElement | null)?.tagName;
         if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
         this.toggleDebug();
       }
@@ -356,6 +427,91 @@ export class GolYaPoochApp {
     this.camera.setLossHandler((reasonFa) => {
       this.dispatch({ type: 'CAMERA_LOST', messageFa: reasonFa });
     });
+  }
+
+  private updateTopbarMuteButton(): void {
+    if (!this.topbarMuteBtn) return;
+    const muted = this.sound.isMuted();
+    this.topbarMuteBtn.textContent = muted ? '🔇 بی‌صدا' : '🔊 صدا';
+    this.topbarMuteBtn.setAttribute(
+      'aria-label',
+      muted ? 'فعال‌سازی صدای بازی' : 'بی‌صدا کردن بازی'
+    );
+    this.topbarMuteBtn.setAttribute('aria-pressed', muted ? 'true' : 'false');
+  }
+
+  private async handleRunBenchmark(): Promise<void> {
+    if (this.benchmarkRunning) return;
+    this.benchmarkRunning = true;
+    if (this.ctx.state === 'BENCHMARK') {
+      this.renderPanel();
+    }
+    try {
+      this.benchmarkReport = await runDeviceBenchmark({
+        temporalModel: this.temporalModel,
+        rafFrames: 24,
+        onnxRuns: 20,
+      });
+    } finally {
+      this.benchmarkRunning = false;
+      if (this.ctx.state === 'BENCHMARK') {
+        this.renderPanel();
+      }
+    }
+  }
+
+  private async refreshRoundCommentary(prevState: GameContext['state']): Promise<void> {
+    if (!this.ctx.lastRoundWinner) return;
+    const lvl = getLevelDefinition(this.ctx.levelId);
+    const effectiveMatchWinner =
+      this.ctx.bestOfMatches === 3 ? this.ctx.seriesWinner : this.ctx.matchWinner;
+
+    const event: CommentaryEvent = effectiveMatchWinner
+      ? {
+          kind: 'MATCH_COMPLETE',
+          levelId: lvl.id,
+          levelNameFa: lvl.nameFa,
+          winner: effectiveMatchWinner,
+          humanScore: this.ctx.humanScore,
+          computerScore: this.ctx.computerScore,
+          unlockedNextLevel: this.lastUnlockedNoticeFa !== null,
+        }
+      : {
+          kind: 'ROUND_RESULT',
+          levelId: lvl.id,
+          levelNameFa: lvl.nameFa,
+          roundNumber: this.ctx.roundNumber,
+          humanScore: this.ctx.humanScore,
+          computerScore: this.ctx.computerScore,
+          targetScore: this.ctx.ruleSet.targetScore,
+          winner: this.ctx.lastRoundWinner,
+          role: prevState === 'HUMAN_GUESS' ? 'COMPUTER_HIDES' : 'HUMAN_HIDES',
+          revealedHand: this.ctx.revealedHand,
+          computerGuess: this.ctx.computerGuess,
+          computerGuessProb: this.ctx.computerGuessProb,
+          handsCount: this.ctx.ruleSet.handsCount,
+          secretHandIndex: this.ctx.commitSecret?.handIndex ?? null,
+          explanationFa: this.ctx.explanationFa,
+          timelineEvents: this.ctx.timelineEvents,
+        };
+
+    // Synchronous instant template fallback so UI is responsive immediately
+    this.lastHostCommentary = {
+      textFa: generateTemplateCommentary(event),
+      source: 'template',
+      latencyMs: 0,
+      fallbackReason: this.llmConfig.enabled ? 'pending-llm' : 'disabled',
+    };
+
+    if (!this.llmConfig.enabled) return;
+
+    const reqSeq = ++this.commentaryRequestSeq;
+    const res = await generateHostCommentary(event, this.llmConfig);
+    if (reqSeq !== this.commentaryRequestSeq) return;
+    this.lastHostCommentary = res;
+    if (this.ctx.state === 'ROUND_RESULT') {
+      this.renderPanel();
+    }
   }
 
   private toggleDebug(): void {
@@ -754,6 +910,7 @@ export class GolYaPoochApp {
         this.lastBelief = null;
         this.lastCommitVerification = null;
       } else if (this.ctx.state === 'HIDING') {
+        this.sound.play('pinchConfirm');
         this.featureExtractor.reset();
         this.hidingFeatureFrames = [];
         this.hidingStartedAtMs = performance.now();
@@ -770,6 +927,7 @@ export class GolYaPoochApp {
         this.stabilityPassed = false;
         this.stabilityProgress = 0;
       } else if (this.ctx.state === 'COMPUTER_HIDES') {
+        this.sound.play('shuffle');
         this.lastUnlockedNoticeFa = null;
         this.showHowItWorks = false;
         this.renderUi();
@@ -780,7 +938,17 @@ export class GolYaPoochApp {
         this.syncPixiSceneState();
       } else if (this.ctx.state === 'ROUND_RESULT') {
         this.verifyAndRecordRoundResult(prevState);
+        this.sound.play('reveal');
+        if (this.ctx.lastRoundWinner === 'HUMAN') {
+          this.sound.play('win');
+        } else if (this.ctx.lastRoundWinner === 'COMPUTER') {
+          this.sound.play('lose');
+        }
+        void this.refreshRoundCommentary(prevState);
         this.syncPixiSceneState();
+      } else if (this.ctx.state === 'ROUND_VOID') {
+        this.sound.play('void');
+        this.pixiScene?.stopChoreography();
       } else {
         this.pixiScene?.stopChoreography();
       }
@@ -852,7 +1020,8 @@ export class GolYaPoochApp {
       this.ctx.state !== 'LEVEL_SELECT' &&
       this.ctx.state !== 'STATS' &&
       this.ctx.state !== 'RULES' &&
-      this.ctx.state !== 'CONSENT'
+      this.ctx.state !== 'CONSENT' &&
+      this.ctx.state !== 'BENCHMARK'
     );
   }
 
@@ -1343,6 +1512,7 @@ export class GolYaPoochApp {
 
     this.videoEl.classList.toggle('mirrored', this.mirrored);
     document.body.classList.toggle('reduced-motion', this.reducedMotion);
+    document.body.classList.toggle('high-contrast', this.highContrast);
 
     const lvl = getLevelDefinition(this.ctx.levelId);
     const inGame =
@@ -1356,7 +1526,7 @@ export class GolYaPoochApp {
 
     this.topbarStatusEl.textContent = inGame
       ? `سطح ${toPersianDigits(lvl.id)} (${lvl.nameFa}) | دور ${toPersianDigits(this.ctx.roundNumber)} | شما ${toPersianDigits(this.ctx.humanScore)} - ${toPersianDigits(this.ctx.computerScore)} رایانه`
-      : `فاز ۴ — سطح ${toPersianDigits(lvl.id)}: ${lvl.nameFa} (${this.ctx.ruleSet.nameFa})`;
+      : `سطح ${toPersianDigits(lvl.id)}: ${lvl.nameFa} (${this.ctx.ruleSet.nameFa})`;
 
     this.renderPanel();
     this.renderDebugPanel();
@@ -1376,55 +1546,90 @@ export class GolYaPoochApp {
     switch (this.ctx.state) {
       case 'SPLASH': {
         card.classList.add('hero-card');
+        const heroLogo = createBrandLogoElement({
+          variant: 'hero',
+          size: 112,
+          idPrefix: 'hero',
+        });
+        heroLogo.setAttribute('data-testid', 'hero-brand-logo');
+
         const badge = document.createElement('div');
         badge.className = 'hero-badge';
-        badge.textContent = FA.splashPrivacyBadge;
+        badge.textContent = `🔒 ${FA.splashPrivacyBadge}`;
 
         const h2 = document.createElement('h2');
+        h2.className = 'hero-wordmark';
         h2.textContent = FA.appTitle;
 
         const p = document.createElement('p');
+        p.className = 'hero-subtitle';
         p.textContent = FA.appSubtitle;
+
+        const tagline = document.createElement('p');
+        tagline.className = 'hero-tagline';
+        tagline.textContent = FA.splashHeroTagline;
+
+        const primaryActions = document.createElement('div');
+        primaryActions.className = 'hero-actions-primary';
 
         const startBtn = document.createElement('button');
         startBtn.type = 'button';
         startBtn.className = 'btn btn-primary';
         startBtn.textContent = FA.splashStartBtn;
         startBtn.setAttribute('data-testid', 'splash-start-btn');
-        startBtn.addEventListener('click', () => this.dispatch({ type: 'GO_PERMISSION' }));
+        startBtn.addEventListener('click', () => {
+          this.sound.play('tap');
+          this.dispatch({ type: 'GO_PERMISSION' });
+        });
 
         const practiceBtn = document.createElement('button');
         practiceBtn.type = 'button';
         practiceBtn.className = 'btn btn-emerald';
         practiceBtn.textContent = FA.splashPracticeBtn;
         practiceBtn.setAttribute('data-testid', 'splash-practice-btn');
-        practiceBtn.addEventListener('click', () =>
-          this.dispatch({ type: 'ENTER_PRACTICE_MENU' })
-        );
+        practiceBtn.addEventListener('click', () => {
+          this.sound.play('tap');
+          this.dispatch({ type: 'ENTER_PRACTICE_MENU' });
+        });
+
+        primaryActions.append(startBtn, practiceBtn);
 
         const replayRow = document.createElement('div');
         replayRow.className = 'btn-row';
+        replayRow.style.justifyContent = 'center';
 
         const replayBtn = document.createElement('button');
         replayBtn.type = 'button';
-        replayBtn.className = 'btn btn-secondary';
+        replayBtn.className = 'btn btn-secondary btn-compact';
         replayBtn.textContent = FA.debugReplaySample;
         replayBtn.setAttribute('data-testid', 'replay-sample-btn');
-        replayBtn.addEventListener('click', () =>
-          this.startSessionReplay(createBuiltInSampleSession())
-        );
+        replayBtn.addEventListener('click', () => {
+          this.sound.play('tap');
+          this.startSessionReplay(createBuiltInSampleSession());
+        });
 
         const transferReplayBtn = document.createElement('button');
         transferReplayBtn.type = 'button';
-        transferReplayBtn.className = 'btn btn-secondary';
+        transferReplayBtn.className = 'btn btn-secondary btn-compact';
         transferReplayBtn.textContent = FA.debugReplayTransfer;
         transferReplayBtn.setAttribute('data-testid', 'replay-transfer-btn');
-        transferReplayBtn.addEventListener('click', () =>
-          this.startSessionReplay(createPhase2TransferSampleSession())
-        );
+        transferReplayBtn.addEventListener('click', () => {
+          this.sound.play('tap');
+          this.startSessionReplay(createPhase2TransferSampleSession());
+        });
 
-        replayRow.append(replayBtn, transferReplayBtn);
-        card.append(badge, h2, p, startBtn, practiceBtn, replayRow);
+        const benchBtn = document.createElement('button');
+        benchBtn.type = 'button';
+        benchBtn.className = 'btn btn-sky btn-compact';
+        benchBtn.textContent = FA.splashBenchmarkBtn;
+        benchBtn.setAttribute('data-testid', 'splash-benchmark-btn');
+        benchBtn.addEventListener('click', () => {
+          this.sound.play('tap');
+          this.dispatch({ type: 'OPEN_BENCHMARK' });
+        });
+
+        replayRow.append(replayBtn, transferReplayBtn, benchBtn);
+        card.append(heroLogo, badge, h2, p, tagline, primaryActions, replayRow);
         break;
       }
 
@@ -1595,6 +1800,22 @@ export class GolYaPoochApp {
         const note = document.createElement('p');
         note.textContent = FA.menuPhaseNote;
 
+        const introCommentary = document.createElement('div');
+        introCommentary.className = 'host-commentary-box';
+        introCommentary.setAttribute('data-testid', 'menu-host-dialogue');
+        const introHead = document.createElement('div');
+        introHead.className = 'host-commentary-head';
+        introHead.textContent = `🎙️ دیالوگ مجری — سطح ${toPersianDigits(lvl.id)} (${lvl.nameFa})`;
+        const introBody = document.createElement('p');
+        introBody.className = 'host-commentary-text';
+        introBody.textContent = generateTemplateCommentary({
+          kind: 'LEVEL_INTRO',
+          levelId: lvl.id,
+          levelNameFa: lvl.nameFa,
+          ruleSetNameFa: this.ctx.ruleSet.nameFa,
+        });
+        introCommentary.append(introHead, introBody);
+
         const levelBanner = document.createElement('div');
         levelBanner.className = 'check-item ok';
         levelBanner.setAttribute('data-testid', 'menu-active-level');
@@ -1603,7 +1824,7 @@ export class GolYaPoochApp {
         lblDiv.textContent = `سطح فعلی: ${toPersianDigits(lvl.id)}. ${lvl.nameFa} — ${lvl.subtitleFa}`;
         const modeSpan = document.createElement('span');
         modeSpan.className = 'check-status ok';
-        modeSpan.textContent = this.ctx.practiceMode ? 'حالت تمرینی' : 'دوربین فعال';
+        modeSpan.textContent = this.ctx.practiceMode ? 'حالت تمرینی 🎯' : 'دوربین فعال 📷';
         levelBanner.append(lblDiv, modeSpan);
 
         const ruleSummary = document.createElement('div');
@@ -1618,43 +1839,71 @@ export class GolYaPoochApp {
         playBtn.className = 'btn btn-primary';
         playBtn.textContent = FA.menuPlayBtn;
         playBtn.setAttribute('data-testid', 'menu-play-btn');
-        playBtn.addEventListener('click', () => this.dispatch({ type: 'START_GAME' }));
+        playBtn.addEventListener('click', () => {
+          this.sound.play('tap');
+          this.dispatch({ type: 'START_GAME' });
+        });
 
         const levelsBtn = document.createElement('button');
         levelsBtn.type = 'button';
         levelsBtn.className = 'btn btn-secondary';
         levelsBtn.textContent = FA.menuLevelsBtn;
         levelsBtn.setAttribute('data-testid', 'menu-levels-btn');
-        levelsBtn.addEventListener('click', () => this.dispatch({ type: 'OPEN_LEVEL_SELECT' }));
+        levelsBtn.addEventListener('click', () => {
+          this.sound.play('tap');
+          this.dispatch({ type: 'OPEN_LEVEL_SELECT' });
+        });
 
         const statsBtn = document.createElement('button');
         statsBtn.type = 'button';
         statsBtn.className = 'btn btn-secondary';
         statsBtn.textContent = FA.menuStatsBtn;
         statsBtn.setAttribute('data-testid', 'menu-stats-btn');
-        statsBtn.addEventListener('click', () => this.dispatch({ type: 'OPEN_STATS' }));
+        statsBtn.addEventListener('click', () => {
+          this.sound.play('tap');
+          this.dispatch({ type: 'OPEN_STATS' });
+        });
 
         const rulesBtn = document.createElement('button');
         rulesBtn.type = 'button';
         rulesBtn.className = 'btn btn-secondary';
         rulesBtn.textContent = FA.menuRulesBtn;
         rulesBtn.setAttribute('data-testid', 'menu-rules-btn');
-        rulesBtn.addEventListener('click', () => this.dispatch({ type: 'OPEN_RULES' }));
+        rulesBtn.addEventListener('click', () => {
+          this.sound.play('tap');
+          this.dispatch({ type: 'OPEN_RULES' });
+        });
 
         const consentBtn = document.createElement('button');
         consentBtn.type = 'button';
         consentBtn.className = 'btn btn-secondary';
         consentBtn.textContent = FA.menuConsentBtn;
         consentBtn.setAttribute('data-testid', 'menu-consent-btn');
-        consentBtn.addEventListener('click', () => this.dispatch({ type: 'OPEN_CONSENT' }));
+        consentBtn.addEventListener('click', () => {
+          this.sound.play('tap');
+          this.dispatch({ type: 'OPEN_CONSENT' });
+        });
+
+        const benchBtn = document.createElement('button');
+        benchBtn.type = 'button';
+        benchBtn.className = 'btn btn-sky';
+        benchBtn.textContent = FA.menuBenchmarkBtn;
+        benchBtn.setAttribute('data-testid', 'open-benchmark-btn');
+        benchBtn.addEventListener('click', () => {
+          this.sound.play('tap');
+          this.dispatch({ type: 'OPEN_BENCHMARK' });
+        });
 
         const calBtn = document.createElement('button');
         calBtn.type = 'button';
         calBtn.className = 'btn btn-secondary';
         calBtn.textContent = FA.menuRecalibrateBtn;
-        calBtn.addEventListener('click', () => this.dispatch({ type: 'OPEN_CALIBRATION' }));
+        calBtn.addEventListener('click', () => {
+          this.sound.play('tap');
+          this.dispatch({ type: 'OPEN_CALIBRATION' });
+        });
 
-        btnRow.append(playBtn, levelsBtn, statsBtn, rulesBtn, consentBtn, calBtn);
+        btnRow.append(playBtn, levelsBtn, statsBtn, rulesBtn, consentBtn, benchBtn, calBtn);
 
         const targetWrap = document.createElement('div');
         targetWrap.style.marginTop = '14px';
@@ -1680,6 +1929,31 @@ export class GolYaPoochApp {
         settingsHeading.textContent = FA.menuSettingsHeading;
 
         const settingsBox = document.createElement('div');
+        const muteRow = this.makeToggleRow(
+          FA.audioMuteLabel,
+          this.sound.isMuted(),
+          (val) => {
+            this.sound.setMuted(val);
+            if (!val) this.sound.play('tap');
+            this.updateTopbarMuteButton();
+          }
+        );
+        muteRow
+          .querySelector('input')
+          ?.setAttribute('data-testid', 'settings-mute-toggle');
+
+        const contrastRow = this.makeToggleRow(
+          FA.highContrastLabel,
+          this.highContrast,
+          (val) => {
+            this.highContrast = val;
+            this.renderUi();
+          }
+        );
+        contrastRow
+          .querySelector('input')
+          ?.setAttribute('data-testid', 'settings-high-contrast-toggle');
+
         const consentRow = this.makeToggleRow(
           FA.consentToggleLabel,
           this.consentSettings.consentEnabled,
@@ -1692,6 +1966,7 @@ export class GolYaPoochApp {
           ?.setAttribute('data-testid', 'settings-consent-toggle');
 
         settingsBox.append(
+          muteRow,
           this.makeToggleRow(FA.calMirrorToggle, this.mirrored, (val) => {
             this.mirrored = val;
             this.renderUi();
@@ -1704,6 +1979,7 @@ export class GolYaPoochApp {
             this.reducedMotion = val;
             this.renderUi();
           }),
+          contrastRow,
           this.makeToggleRow(FA.debugToggleLabel, this.showDebug, (val) => {
             this.showDebug = val;
             this.renderDebugPanel();
@@ -1711,11 +1987,170 @@ export class GolYaPoochApp {
           consentRow
         );
 
+        if (this.cameraDevices.length > 0) {
+          const camGroup = document.createElement('div');
+          camGroup.className = 'field-group';
+          const camLbl = document.createElement('label');
+          camLbl.textContent = FA.cameraSelectLabel;
+          const camSel = document.createElement('select');
+          camSel.className = 'field-select';
+          camSel.setAttribute('data-testid', 'settings-camera-select');
+          for (const dev of this.cameraDevices) {
+            const opt = document.createElement('option');
+            opt.value = dev.deviceId;
+            opt.textContent = dev.label;
+            opt.selected = dev.deviceId === this.camera.currentDeviceId;
+            camSel.append(opt);
+          }
+          camSel.addEventListener('change', () => {
+            void this.camera.switchDevice(camSel.value);
+          });
+          camGroup.append(camLbl, camSel);
+          settingsBox.append(camGroup);
+        }
+
+        // Optional LLM Commentary Settings (OFF by default, text-only, localStorage key)
+        const llmBox = document.createElement('div');
+        llmBox.className = 'llm-settings-box';
+        llmBox.setAttribute('data-testid', 'llm-settings-panel');
+
+        const llmTitle = document.createElement('h3');
+        llmTitle.textContent = FA.llmSettingsHeading;
+
+        const llmNote = document.createElement('p');
+        llmNote.className = 'check-hint';
+        llmNote.textContent = FA.llmPrivacyNote;
+
+        const llmEnableRow = this.makeToggleRow(
+          FA.llmEnabledToggleLabel,
+          this.llmConfig.enabled,
+          (val) => {
+            this.llmConfig = saveLlmConfig({ ...this.llmConfig, enabled: val });
+            this.llmNoticeError = false;
+            this.llmNoticeFa = val
+              ? 'تفسیرگر اختیاری LLM فعال شد (در صورت خطا یا تأخیر > ۳ ثانیه بازگشت خودکار دارد).'
+              : 'تفسیرگر اختیاری LLM خاموش شد؛ از مجری قالب آماده محلی استفاده می‌شود.';
+            this.renderPanel();
+          }
+        );
+        llmEnableRow
+          .querySelector('input')
+          ?.setAttribute('data-testid', 'llm-enabled-toggle');
+
+        const epGroup = document.createElement('div');
+        epGroup.className = 'field-group';
+        const epLbl = document.createElement('label');
+        epLbl.textContent = FA.llmEndpointLabel;
+        const epInput = document.createElement('input');
+        epInput.type = 'url';
+        epInput.className = 'field-input ltr-inline';
+        epInput.placeholder = 'https://api.openai.com/v1/chat/completions';
+        epInput.value = this.llmConfig.endpointUrl;
+        epInput.setAttribute('data-testid', 'llm-endpoint-input');
+        epGroup.append(epLbl, epInput);
+
+        const modelGroup = document.createElement('div');
+        modelGroup.className = 'field-group';
+        const modelLbl = document.createElement('label');
+        modelLbl.textContent = FA.llmModelLabel;
+        const modelInput = document.createElement('input');
+        modelInput.type = 'text';
+        modelInput.className = 'field-input ltr-inline';
+        modelInput.value = this.llmConfig.model;
+        modelInput.setAttribute('data-testid', 'llm-model-input');
+        modelGroup.append(modelLbl, modelInput);
+
+        const keyGroup = document.createElement('div');
+        keyGroup.className = 'field-group';
+        const keyLbl = document.createElement('label');
+        keyLbl.textContent = FA.llmApiKeyLabel;
+        const keyInput = document.createElement('input');
+        keyInput.type = 'password';
+        keyInput.autocomplete = 'off';
+        keyInput.className = 'field-input ltr-inline';
+        keyInput.placeholder = 'sk-... (فقط در localStorage)';
+        keyInput.value = this.llmConfig.apiKey;
+        keyInput.setAttribute('data-testid', 'llm-apikey-input');
+        keyGroup.append(keyLbl, keyInput);
+
+        const llmBtnRow = document.createElement('div');
+        llmBtnRow.className = 'btn-row';
+
+        const llmSaveBtn = document.createElement('button');
+        llmSaveBtn.type = 'button';
+        llmSaveBtn.className = 'btn btn-secondary btn-compact';
+        llmSaveBtn.textContent = FA.llmSaveBtn;
+        llmSaveBtn.setAttribute('data-testid', 'llm-save-btn');
+        llmSaveBtn.addEventListener('click', () => {
+          this.llmConfig = saveLlmConfig({
+            ...this.llmConfig,
+            endpointUrl: epInput.value,
+            model: modelInput.value,
+            apiKey: keyInput.value,
+          });
+          this.llmNoticeError = false;
+          this.llmNoticeFa = 'تنظیمات تفسیرگر LLM در localStorage ذخیره شد.';
+          this.renderPanel();
+        });
+
+        const llmTestBtn = document.createElement('button');
+        llmTestBtn.type = 'button';
+        llmTestBtn.className = 'btn btn-sky btn-compact';
+        llmTestBtn.textContent = FA.llmTestBtn;
+        llmTestBtn.setAttribute('data-testid', 'llm-test-btn');
+        llmTestBtn.addEventListener('click', () => {
+          this.llmConfig = saveLlmConfig({
+            ...this.llmConfig,
+            endpointUrl: epInput.value,
+            model: modelInput.value,
+            apiKey: keyInput.value,
+          });
+          void generateHostCommentary(
+            {
+              kind: 'LEVEL_INTRO',
+              levelId: lvl.id,
+              levelNameFa: lvl.nameFa,
+              ruleSetNameFa: this.ctx.ruleSet.nameFa,
+            },
+            this.llmConfig
+          ).then((res) => {
+            this.llmNoticeError = false;
+            this.llmNoticeFa =
+              res.source === 'llm'
+                ? `پاسخ زنده LLM (${toPersianDigits(Math.round(res.latencyMs))} ms): ${res.textFa}`
+                : `بازگشت ایمن به مجری آماده (${res.fallbackReason ?? 'fallback'}): ${res.textFa}`;
+            this.renderPanel();
+          });
+        });
+
+        const llmClearBtn = document.createElement('button');
+        llmClearBtn.type = 'button';
+        llmClearBtn.className = 'btn btn-danger btn-compact';
+        llmClearBtn.textContent = FA.llmClearKeyBtn;
+        llmClearBtn.setAttribute('data-testid', 'llm-clear-key-btn');
+        llmClearBtn.addEventListener('click', () => {
+          this.llmConfig = clearLlmApiKey();
+          this.llmNoticeError = false;
+          this.llmNoticeFa = 'کلید API از localStorage پاک و تفسیرگر خاموش شد.';
+          this.renderPanel();
+        });
+
+        llmBtnRow.append(llmSaveBtn, llmTestBtn, llmClearBtn);
+        llmBox.append(llmTitle, llmNote, llmEnableRow, epGroup, modelGroup, keyGroup, llmBtnRow);
+
+        if (this.llmNoticeFa) {
+          const ln = document.createElement('div');
+          ln.className = `status-notice${this.llmNoticeError ? ' error' : ''}`;
+          ln.setAttribute('data-testid', 'llm-status-notice');
+          ln.textContent = this.llmNoticeFa;
+          llmBox.append(ln);
+        }
+
         const memRow = document.createElement('div');
         memRow.className = 'btn-row';
         const memStat = document.createElement('span');
-        memStat.className = 'check-hint';
-        memStat.textContent = `دورهای ثبت‌شده: ${toPersianDigits(this.progression.totalRoundsPlayed)} | لاگ عددی (فاز ۴): ${toPersianDigits(this.loggedRoundsCount)} (${this.consentSettings.consentEnabled ? 'فعال' : 'پیش‌فرض خاموش'})`;
+        memStat.className = 'check-hint tabular-nums';
+        memStat.textContent = `دورهای ثبت‌شده: ${toPersianDigits(this.progression.totalRoundsPlayed)} | لاگ عددی: ${toPersianDigits(this.loggedRoundsCount)} (${this.consentSettings.consentEnabled ? 'فعال' : 'پیش‌فرض خاموش'})`;
 
         const exportLogsBtn = document.createElement('button');
         exportLogsBtn.type = 'button';
@@ -1744,12 +2179,14 @@ export class GolYaPoochApp {
         card.append(
           h2,
           note,
+          introCommentary,
           levelBanner,
           ruleSummary,
           btnRow,
           targetWrap,
           settingsHeading,
           settingsBox,
+          llmBox,
           memRow
         );
         if (this.logNoticeFa) {
@@ -2073,8 +2510,26 @@ export class GolYaPoochApp {
       }
 
       case 'RULES': {
+        card.setAttribute('data-testid', 'rules-screen');
         const h2 = document.createElement('h2');
         h2.textContent = FA.rulesTitle;
+
+        const guideWrap = document.createElement('div');
+        guideWrap.setAttribute('data-testid', 'rules-book-sections');
+        for (const sec of RULES_BOOK_SECTIONS_FA) {
+          const secBox = document.createElement('div');
+          secBox.className = 'rules-book-section';
+          const sh = document.createElement('h3');
+          sh.textContent = sec.title;
+          const ul = document.createElement('ul');
+          for (const item of sec.items) {
+            const li = document.createElement('li');
+            li.textContent = item;
+            ul.append(li);
+          }
+          secBox.append(sh, ul);
+          guideWrap.append(secBox);
+        }
 
         const teamCountWrap = document.createElement('div');
         teamCountWrap.style.marginBottom = '12px';
@@ -2117,6 +2572,7 @@ export class GolYaPoochApp {
           useBtn.textContent = this.ctx.ruleSet.id === rule.id ? 'فعال ✓' : 'اعمال قانون';
           useBtn.setAttribute('data-testid', `apply-rule-${rule.id}`);
           useBtn.addEventListener('click', () => {
+            this.sound.play('tap');
             this.dispatch({ type: 'SET_CUSTOM_RULES', ruleSet: rule });
           });
 
@@ -2128,9 +2584,110 @@ export class GolYaPoochApp {
         backBtn.type = 'button';
         backBtn.className = 'btn btn-secondary';
         backBtn.textContent = FA.exitToMenuBtn;
-        backBtn.addEventListener('click', () => this.dispatch({ type: 'EXIT_TO_MENU' }));
+        backBtn.addEventListener('click', () => {
+          this.sound.play('tap');
+          this.dispatch({ type: 'EXIT_TO_MENU' });
+        });
 
-        card.append(h2, teamCountWrap, list, backBtn);
+        card.append(h2, teamCountWrap, list, guideWrap, backBtn);
+        break;
+      }
+
+      case 'BENCHMARK': {
+        card.setAttribute('data-testid', 'benchmark-screen');
+        const h2 = document.createElement('h2');
+        h2.textContent = FA.benchmarkTitle;
+
+        const intro = document.createElement('p');
+        intro.textContent = FA.benchmarkIntro;
+
+        const btnRow = document.createElement('div');
+        btnRow.className = 'btn-row';
+
+        const runBtn = document.createElement('button');
+        runBtn.type = 'button';
+        runBtn.className = 'btn btn-primary';
+        runBtn.disabled = this.benchmarkRunning;
+        runBtn.textContent = this.benchmarkRunning
+          ? 'در حال اندازه‌گیری واقعی… ⏳'
+          : FA.benchmarkRunBtn;
+        runBtn.setAttribute('data-testid', 'run-benchmark-btn');
+        runBtn.addEventListener('click', () => {
+          this.sound.play('tap');
+          void this.handleRunBenchmark();
+        });
+
+        const backBtn = document.createElement('button');
+        backBtn.type = 'button';
+        backBtn.className = 'btn btn-secondary';
+        backBtn.textContent = FA.exitToMenuBtn;
+        backBtn.setAttribute('data-testid', 'benchmark-back-btn');
+        backBtn.addEventListener('click', () => {
+          this.sound.play('tap');
+          this.dispatch({ type: 'EXIT_TO_MENU' });
+        });
+
+        btnRow.append(runBtn, backBtn);
+        card.append(h2, intro, btnRow);
+
+        if (this.benchmarkReport) {
+          const r = this.benchmarkReport;
+          const grid = document.createElement('div');
+          grid.className = 'benchmark-grid';
+          grid.setAttribute('data-testid', 'benchmark-results');
+
+          const tiles: Array<[string, string, string]> = [
+            [
+              'نرخ فریم صفحه (RAF FPS)',
+              `${toPersianDigits(r.rafFrameLoop.estimatedFps.toFixed(1))} FPS`,
+              `میانگین فریم: ${toPersianDigits(r.rafFrameLoop.meanFrameMs.toFixed(2))} ms (${toPersianDigits(r.rafFrameLoop.framesMeasured)} فریم)`,
+            ],
+            [
+              'استخراج ویژگی‌ها (Feature)',
+              `${toPersianDigits(r.featureExtraction.meanMs.toFixed(3))} ms`,
+              `p95: ${toPersianDigits(r.featureExtraction.p95Ms.toFixed(3))} ms (${toPersianDigits(r.featureExtraction.runs)} بار)`,
+            ],
+            [
+              'گام فیلتر باور (HMM)',
+              `${toPersianDigits(r.hmmFilterStep.meanMs.toFixed(3))} ms`,
+              `p95: ${toPersianDigits(r.hmmFilterStep.p95Ms.toFixed(3))} ms (${toPersianDigits(r.hmmFilterStep.runs)} بار)`,
+            ],
+            [
+              `استنتاج ONNX (${r.onnxInference.backend})`,
+              `${toPersianDigits(r.onnxInference.meanMs.toFixed(2))} ms`,
+              `min ${toPersianDigits(r.onnxInference.minMs.toFixed(2))} / p95 ${toPersianDigits(r.onnxInference.p95Ms.toFixed(2))} ms | ${r.onnxInference.within10msBudget ? '✓ زیر ۱۰ms' : '⚠ بالای ۱۰ms'}`,
+            ],
+            [
+              'مجموع پردازش هر فریم',
+              `${toPersianDigits(r.estimatedPipelineFrameMs.toFixed(2))} ms`,
+              `بودجه ۳۰ FPS: ${r.meets30FpsBudget ? '✓ مناسب' : '⚠ کند'} | ۲۴ FPS: ${r.meets24FpsBudget ? '✓ مناسب' : '⚠ کند'}`,
+            ],
+          ];
+
+          for (const [label, val, sub] of tiles) {
+            const tile = document.createElement('div');
+            tile.className = 'bench-tile';
+            const l = document.createElement('div');
+            l.className = 'hud-stat-label';
+            l.textContent = label;
+            const v = document.createElement('strong');
+            v.className = 'bench-value';
+            v.textContent = val;
+            const s = document.createElement('span');
+            s.className = 'check-hint tabular-nums';
+            s.textContent = sub;
+            tile.append(l, v, s);
+            grid.append(tile);
+          }
+
+          const meta = document.createElement('div');
+          meta.className = 'how-it-works-box ltr-inline';
+          meta.style.width = '100%';
+          meta.setAttribute('data-testid', 'benchmark-meta');
+          meta.textContent = `cores=${r.hardwareConcurrency} | ort=${r.onnxInference.ready ? r.onnxInference.backend : 'fallback'} (${r.onnxInference.modelVersion ?? 'none'}) | ts=${r.timestampIso}`;
+
+          card.append(grid, meta);
+        }
         break;
       }
 
@@ -2458,6 +3015,24 @@ export class GolYaPoochApp {
           }
 
           card.append(detail, explainBox);
+        }
+
+        if (this.lastHostCommentary) {
+          const hostBox = document.createElement('div');
+          hostBox.className = 'host-commentary-box';
+          hostBox.setAttribute('data-testid', 'host-commentary-box');
+          const hostHead = document.createElement('div');
+          hostHead.className = 'host-commentary-head';
+          const sourceLabel =
+            this.lastHostCommentary.source === 'llm'
+              ? '✨ تفسیر زنده LLM (فقط متن)'
+              : '🎙️ گزارش مجری (قالب محلی)';
+          hostHead.textContent = sourceLabel;
+          const hostText = document.createElement('p');
+          hostText.className = 'host-commentary-text';
+          hostText.textContent = this.lastHostCommentary.textFa;
+          hostBox.append(hostHead, hostText);
+          card.append(hostBox);
         }
 
         const btnRow = document.createElement('div');
@@ -2952,7 +3527,17 @@ export class GolYaPoochApp {
       void this.runDebugOnnxBenchmark();
     });
 
-    btnRow.append(recBtn, sampleBtn, transferBtn, loadBtn, benchOnnxBtn, fileInput);
+    const fullBenchBtn = document.createElement('button');
+    fullBenchBtn.type = 'button';
+    fullBenchBtn.className = 'btn btn-sky btn-compact';
+    fullBenchBtn.textContent = 'بنچمارک کامل دستگاه';
+    fullBenchBtn.setAttribute('data-testid', 'debug-open-benchmark-btn');
+    fullBenchBtn.addEventListener('click', () => {
+      this.dispatch({ type: 'OPEN_BENCHMARK' });
+      void this.handleRunBenchmark();
+    });
+
+    btnRow.append(recBtn, sampleBtn, transferBtn, loadBtn, benchOnnxBtn, fullBenchBtn, fileInput);
     this.debugContainer.append(title, grid, beliefSection, btnRow);
     this.updateDebugMetricsInPlace();
 

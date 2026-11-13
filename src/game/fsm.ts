@@ -25,6 +25,7 @@ export const ALL_FSM_STATES = [
   'STATS',
   'RULES',
   'CONSENT',
+  'BENCHMARK',
   'SHOW_GOL',
   'HIDING',
   'COMPUTER_GUESS',
@@ -141,6 +142,7 @@ export type GameEvent =
   | { type: 'OPEN_STATS' }
   | { type: 'OPEN_RULES' }
   | { type: 'OPEN_CONSENT' }
+  | { type: 'OPEN_BENCHMARK' }
   | {
       type: 'SELECT_LEVEL';
       levelId: LevelId;
@@ -581,6 +583,9 @@ export function transitionGameFsm(ctx: GameContext, event: GameEvent): GameConte
       if (event.type === 'ENTER_PRACTICE_MENU') {
         return { ...ctx, practiceMode: true, state: 'MENU' };
       }
+      if (event.type === 'OPEN_BENCHMARK') {
+        return { ...ctx, practiceMode: true, state: 'BENCHMARK' };
+      }
       return ctx;
     }
 
@@ -620,6 +625,9 @@ export function transitionGameFsm(ctx: GameContext, event: GameEvent): GameConte
       if (event.type === 'OPEN_CONSENT') {
         return { ...ctx, state: 'CONSENT' };
       }
+      if (event.type === 'OPEN_BENCHMARK') {
+        return { ...ctx, state: 'BENCHMARK' };
+      }
       if (event.type === 'START_GAME') {
         if (!ctx.calibrated && !ctx.practiceMode) {
           return { ...ctx, state: 'CALIBRATION' };
@@ -639,7 +647,8 @@ export function transitionGameFsm(ctx: GameContext, event: GameEvent): GameConte
     case 'LEVEL_SELECT':
     case 'STATS':
     case 'RULES':
-    case 'CONSENT': {
+    case 'CONSENT':
+    case 'BENCHMARK': {
       if (event.type === 'EXIT_TO_MENU') {
         return { ...ctx, state: 'MENU' };
       }
