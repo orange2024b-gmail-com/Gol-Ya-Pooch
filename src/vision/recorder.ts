@@ -1,3 +1,5 @@
+import type { FrameFeatures } from './features';
+import { FeatureExtractor } from './features';
 import { PinchConfirmationTracker } from './golDetector';
 import { HandIdentityTracker } from './handTracker';
 import type {
@@ -20,6 +22,7 @@ export interface RecorderFrameInput {
   rawDetections: RawHandDetection[];
   hands: VisionFrameHands;
   quality?: QualityReport;
+  features?: FrameFeatures;
   pinch?: PinchObservation[];
   reveal?: RecordedRevealSummary;
 }
@@ -91,6 +94,7 @@ export class SessionRecorder {
             },
           }
         : {}),
+      ...(input.features ? { features: input.features } : {}),
       ...(input.pinch && input.pinch.length > 0
         ? {
             pinch: input.pinch.map(
@@ -144,6 +148,7 @@ export interface ReplayedFrameResult {
   frameIndex: number;
   timestampMs: number;
   hands: VisionFrameHands;
+  features: FrameFeatures;
   pinchState: PinchConfirmationState;
   quality?: RecordedFrame['quality'];
   reveal?: RecordedRevealSummary;
@@ -164,6 +169,7 @@ export function replayRecordedSession(
   options: { requiredPinchFrames?: number } = {}
 ): ReplaySummary {
   const identityTracker = new HandIdentityTracker();
+  const featureExtractor = new FeatureExtractor();
   const pinchTracker = new PinchConfirmationTracker(options.requiredPinchFrames);
   const frames: ReplayedFrameResult[] = [];
 
@@ -175,6 +181,25 @@ export function replayRecordedSession(
     const recFrame = session.frames[i]!;
     const hands = identityTracker.update(recFrame.rawDetections, recFrame.timestampMs);
     maxLostDurationMs = Math.max(maxLostDurationMs, hands.maxLostDurationMs);
+
+    const features =
+      recFrame.features ??
+      featureExtractor.update({
+        hands,
+        ...(recFrame.quality
+          ? {
+              quality: {
+                ...recFrame.quality,
+                lightingHintFa: null,
+                blurOk: recFrame.quality.blurScore >= 18,
+                bothHandsDetected: hands.bothDetected,
+                minHandConfidence: Math.min(hands.left.confidence, hands.right.confidence),
+                confidenceOk: hands.bothDetected,
+                distanceHintFa: null,
+              },
+            }
+          : {}),
+      });
 
     const pinchObs: PinchObservation[] = (recFrame.pinch ?? []).map((p) => ({
       side: p.side,
@@ -205,6 +230,7 @@ export function replayRecordedSession(
       frameIndex: i,
       timestampMs: recFrame.timestampMs,
       hands,
+      features,
       pinchState,
       ...(recFrame.quality ? { quality: recFrame.quality } : {}),
       ...(recFrame.reveal ? { reveal: recFrame.reveal } : {}),

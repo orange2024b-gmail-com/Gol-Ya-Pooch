@@ -171,6 +171,7 @@ export interface RecordedFrame {
     QualityReport,
     'meanLuminance' | 'contrastStd' | 'blurScore' | 'lightingOk' | 'distanceOk'
   >;
+  features?: import('./features').FrameFeatures;
   pinch?: RecordedPinchSummary[];
   reveal?: RecordedRevealSummary;
 }
