@@ -1,0 +1,33 @@
+{
+  "id": "traditional-team",
+  "version": 1,
+  "nameFa": "تیمی سنتی (پوچ و گل)",
+  "nameEn": "Traditional Team",
+  "descriptionFa": "۴ تا ۶ دست بسته و حداکثر ۳ حدس. پیدا کردن مستقیم گل +۲ امتیاز و تغییر نوبت؛ پیدا کردن گل پس از پوچ +۰ امتیاز و تغییر نوبت؛ پوچ روی گل یا اتمام حدس‌ها +۱ امتیاز برای تیم پنهان‌کننده.",
+  "handsCount": 4,
+  "targetScore": 7,
+  "maxGuessesPerRound": 3,
+  "allowPoochCalls": true,
+  "scoring": {
+    "correctGolNoWrongCalls": 2,
+    "correctGolAfterPoochCalls": 0,
+    "wrongGuessOrOutOfGuessesHiderPoints": 1,
+    "voidRoundPoints": 0
+  },
+  "turnPolicy": {
+    "passTurnOnCorrectGuess": true,
+    "keepTurnOnWrongGuess": true
+  },
+  "timeoutsMs": {
+    "showGol": 12000,
+    "hiding": 10000,
+    "guessDisplay": 2500,
+    "revealVerify": 10000
+  },
+  "voidConditions": {
+    "maxHandLostMs": 500,
+    "voidOnRevealNeither": true,
+    "voidOnRevealBoth": true,
+    "voidOnTimeout": true
+  }
+}

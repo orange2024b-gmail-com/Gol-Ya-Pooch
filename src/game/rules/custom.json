@@ -1,0 +1,33 @@
+{
+  "id": "custom",
+  "version": 1,
+  "nameFa": "قوانین سفارشی",
+  "nameEn": "Custom Template",
+  "descriptionFa": "الگوی قابل تنظیم برای تعریف تعداد دست‌ها، سقف حدس، امتیازدهی و زمان‌بندی بدون تغییر کد.",
+  "handsCount": 4,
+  "targetScore": 5,
+  "maxGuessesPerRound": 2,
+  "allowPoochCalls": true,
+  "scoring": {
+    "correctGolNoWrongCalls": 2,
+    "correctGolAfterPoochCalls": 1,
+    "wrongGuessOrOutOfGuessesHiderPoints": 1,
+    "voidRoundPoints": 0
+  },
+  "turnPolicy": {
+    "passTurnOnCorrectGuess": true,
+    "keepTurnOnWrongGuess": true
+  },
+  "timeoutsMs": {
+    "showGol": 12000,
+    "hiding": 10000,
+    "guessDisplay": 2500,
+    "revealVerify": 10000
+  },
+  "voidConditions": {
+    "maxHandLostMs": 500,
+    "voidOnRevealNeither": true,
+    "voidOnRevealBoth": true,
+    "voidOnTimeout": true
+  }
+}

@@ -18,7 +18,8 @@
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "1.2.3",
-    "idb": "8.0.4"
+    "idb": "8.0.4",
+    "pixi.js": "8.23.0"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
