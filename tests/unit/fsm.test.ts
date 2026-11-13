@@ -6,13 +6,14 @@ import {
   type GameContext,
   type GameEvent,
 } from '../../src/game/fsm';
+import { createCommitEnvelope } from '../../src/game/commitReveal';
 
 function runSequence(initial: GameContext, events: GameEvent[]): GameContext {
   return events.reduce((ctx, ev) => transitionGameFsm(ctx, ev), initial);
 }
 
-describe('Game FSM: 100% state & transition coverage', () => {
-  it('covers splash -> permission -> calibration -> menu -> full valid round -> result -> next round / reset / exit', () => {
+describe('Game FSM: 100% state & transition coverage (Phases 1-3)', () => {
+  it('covers splash -> permission -> calibration -> menu -> human-hides & computer-hides alternation -> reset / exit', async () => {
     let ctx = createInitialGameContext();
     expect(ctx.state).toBe('SPLASH');
 
@@ -30,6 +31,22 @@ describe('Game FSM: 100% state & transition coverage', () => {
     ctx = transitionGameFsm(ctx, { type: 'CALIBRATION_COMPLETE' });
     expect(ctx.state).toBe('MENU');
     expect(ctx.calibrated).toBe(true);
+
+    // Sub-screens: LEVEL_SELECT, STATS, RULES
+    ctx = transitionGameFsm(ctx, { type: 'OPEN_LEVEL_SELECT' });
+    expect(ctx.state).toBe('LEVEL_SELECT');
+    ctx = transitionGameFsm(ctx, { type: 'EXIT_TO_MENU' });
+    expect(ctx.state).toBe('MENU');
+
+    ctx = transitionGameFsm(ctx, { type: 'OPEN_STATS' });
+    expect(ctx.state).toBe('STATS');
+    ctx = transitionGameFsm(ctx, { type: 'EXIT_TO_MENU' });
+    expect(ctx.state).toBe('MENU');
+
+    ctx = transitionGameFsm(ctx, { type: 'OPEN_RULES' });
+    expect(ctx.state).toBe('RULES');
+    ctx = transitionGameFsm(ctx, { type: 'EXIT_TO_MENU' });
+    expect(ctx.state).toBe('MENU');
 
     // Re-entering calibration and exiting back to menu once calibrated
     ctx = transitionGameFsm(ctx, { type: 'OPEN_CALIBRATION' });
@@ -51,7 +68,7 @@ describe('Game FSM: 100% state & transition coverage', () => {
     );
     expect(recal.state).toBe('MENU');
 
-    // Start game
+    // Start game (Human hides first)
     ctx = transitionGameFsm(ctx, { type: 'START_GAME' });
     expect(ctx.state).toBe('SHOW_GOL');
     expect(ctx.pinchConfirmed).toBe(false);
@@ -98,27 +115,41 @@ describe('Game FSM: 100% state & transition coverage', () => {
     ctx = transitionGameFsm(ctx, { type: 'REVEAL_VERIFIED', outcome: 'HANDS_NOT_OPEN' });
     expect(ctx.state).toBe('REVEAL_VERIFY');
 
-    // Correct computer guess -> computer scores +1
+    // Correct computer guess -> computer scores +1 and turn passes to COMPUTER_HIDES
     ctx = transitionGameFsm(ctx, { type: 'REVEAL_VERIFIED', outcome: 'LEFT' });
     expect(ctx.state).toBe('ROUND_RESULT');
     expect(ctx.computerScore).toBe(1);
     expect(ctx.humanScore).toBe(0);
     expect(ctx.lastRoundWinner).toBe('COMPUTER');
+    expect(ctx.ruleHiderOwner).toBe('COMPUTER');
 
-    // Next round -> human scores +1
-    ctx = transitionGameFsm(ctx, { type: 'NEXT_ROUND' });
-    expect(ctx.state).toBe('SHOW_GOL');
+    // Next round -> COMPUTER_HIDES
+    const env = await createCommitEnvelope(1, 2);
+    ctx = transitionGameFsm(ctx, {
+      type: 'NEXT_ROUND',
+      computerHideSetup: {
+        secretGolHandIndex: 1,
+        commitPublic: env.publicInfo,
+        commitSecret: env.secret,
+      },
+    });
+    expect(ctx.state).toBe('COMPUTER_HIDES');
     expect(ctx.roundNumber).toBe(2);
-    ctx = runSequence(ctx, [
-      { type: 'PINCH_CONFIRMED', side: 'RIGHT' },
-      { type: 'TICK', dtMs: 20_000, maxLostDurationMs: 0, randomBit: 0 },
-      { type: 'PROCEED_TO_REVEAL' },
-      { type: 'REVEAL_VERIFIED', outcome: 'RIGHT' },
-    ]);
+
+    ctx = transitionGameFsm(ctx, { type: 'COMPUTER_SHUFFLE_DONE' });
+    expect(ctx.state).toBe('HUMAN_GUESS');
+
+    // Human guesses hand 1 correctly -> human scores +1 and turn passes back to HUMAN
+    ctx = transitionGameFsm(ctx, { type: 'HUMAN_GUESS_CALL', handIndex: 1, callType: 'GOL' });
     expect(ctx.state).toBe('ROUND_RESULT');
     expect(ctx.humanScore).toBe(1);
     expect(ctx.computerScore).toBe(1);
     expect(ctx.lastRoundWinner).toBe('HUMAN');
+    expect(ctx.ruleHiderOwner).toBe('HUMAN');
+
+    // Next round returns to SHOW_GOL
+    const round3 = transitionGameFsm(ctx, { type: 'NEXT_ROUND' });
+    expect(round3.state).toBe('SHOW_GOL');
 
     // Reset match & exit to menu
     const resetCtx = transitionGameFsm(ctx, { type: 'RESET_MATCH' });
@@ -129,7 +160,7 @@ describe('Game FSM: 100% state & transition coverage', () => {
     expect(transitionGameFsm(ctx, { type: 'EXIT_TO_MENU' }).state).toBe('MENU');
   });
 
-  it('enforces all void-round rules (hands lost > 0.5s, show timeout, reveal neither/both/timeout)', () => {
+  it('enforces all void-round rules (hands lost > 0.5s, show timeout, Level 3 contact required, reveal neither/both/timeout)', () => {
     const baseShow = runSequence(createInitialGameContext(), [
       { type: 'GO_PERMISSION' },
       { type: 'CAMERA_READY' },
@@ -165,7 +196,26 @@ describe('Game FSM: 100% state & transition coverage', () => {
     expect(lostHide.state).toBe('ROUND_VOID');
     expect(lostHide.voidReason).toBe('HANDS_LOST');
 
-    // 4. Reveal NEITHER, BOTH, and timeout
+    // 4. Level 3 (>= 1 hand contact required) void when contactCount === 0, valid when >= 1
+    let lvl3 = runSequence(createInitialGameContext(), [
+      { type: 'GO_PERMISSION' },
+      { type: 'CAMERA_READY' },
+      { type: 'CALIBRATION_COMPLETE' },
+      { type: 'SELECT_LEVEL', levelId: 3 },
+      { type: 'START_GAME' },
+      { type: 'PINCH_CONFIRMED', side: 'LEFT' },
+    ]);
+    expect(lvl3.config.minHandContactsRequired).toBe(1);
+    expect(lvl3.config.hideDurationMs).toBe(7000);
+    const lvl3Void = transitionGameFsm(lvl3, { type: 'FINISH_HIDING', contactCount: 0 });
+    expect(lvl3Void.state).toBe('ROUND_VOID');
+    expect(lvl3Void.voidReason).toBe('NO_HAND_CONTACT');
+
+    lvl3 = transitionGameFsm(lvl3, { type: 'TICK', dtMs: 500, contactCount: 1 });
+    const lvl3Ok = transitionGameFsm(lvl3, { type: 'FINISH_HIDING' });
+    expect(lvl3Ok.state).toBe('COMPUTER_GUESS');
+
+    // 5. Reveal NEITHER, BOTH, and timeout
     const revealState = runSequence(hiding, [
       { type: 'TICK', dtMs: 15_000, randomBit: 1 },
       { type: 'PROCEED_TO_REVEAL' },
@@ -212,27 +262,22 @@ describe('Game FSM: 100% state & transition coverage', () => {
     const paused = transitionGameFsm(inHide, { type: 'TAB_HIDDEN' });
     expect(paused.state).toBe('PAUSED');
     expect(paused.pausedFrom).toBe('HIDING');
-    // Repeated TAB_HIDDEN is idempotent
     expect(transitionGameFsm(paused, { type: 'TAB_HIDDEN' }).state).toBe('PAUSED');
 
     const resumed = transitionGameFsm(paused, { type: 'TAB_VISIBLE' });
     expect(resumed.state).toBe('HIDING');
     expect(resumed.phaseRemainingMs).toBe(inHide.phaseRemainingMs);
 
-    // Exiting from paused
     expect(transitionGameFsm(paused, { type: 'EXIT_TO_MENU' }).state).toBe('MENU');
 
-    // Camera loss mid-round -> CAMERA_ERROR -> CAMERA_RECOVERED -> ROUND_VOID (no crash, scores preserved)
     const camErr = transitionGameFsm(inHide, { type: 'CAMERA_LOST' });
     expect(camErr.state).toBe('CAMERA_ERROR');
-    // Repeated CAMERA_LOST is idempotent
     expect(transitionGameFsm(camErr, { type: 'CAMERA_LOST' }).state).toBe('CAMERA_ERROR');
 
     const recovered = transitionGameFsm(camErr, { type: 'CAMERA_RECOVERED' });
     expect(recovered.state).toBe('ROUND_VOID');
     expect(recovered.voidReason).toBe('CAMERA_INTERRUPTED');
 
-    // Camera loss while in CALIBRATION recovers directly to CALIBRATION
     const inCal = runSequence(createInitialGameContext(), [
       { type: 'GO_PERMISSION' },
       { type: 'CAMERA_READY' },
@@ -242,8 +287,14 @@ describe('Game FSM: 100% state & transition coverage', () => {
     expect(transitionGameFsm(calErr, { type: 'CAMERA_RECOVERED' }).state).toBe('CALIBRATION');
     expect(transitionGameFsm(calErr, { type: 'RETRY_PERMISSION' }).state).toBe('PERMISSION');
 
-    // Exiting from active gameplay states
-    for (const activeState of ['SHOW_GOL', 'HIDING', 'COMPUTER_GUESS', 'REVEAL_VERIFY'] as const) {
+    for (const activeState of [
+      'SHOW_GOL',
+      'HIDING',
+      'COMPUTER_GUESS',
+      'REVEAL_VERIFY',
+      'COMPUTER_HIDES',
+      'HUMAN_GUESS',
+    ] as const) {
       const exited = transitionGameFsm(
         { ...inHide, state: activeState },
         { type: 'EXIT_TO_MENU' }
@@ -251,8 +302,7 @@ describe('Game FSM: 100% state & transition coverage', () => {
       expect(exited.state).toBe('MENU');
     }
 
-    // All FSM states are valid and reachable, and unhandled events are safe no-ops
-    expect(ALL_FSM_STATES.length).toBe(12);
+    expect(ALL_FSM_STATES.length).toBe(17);
     for (const s of ALL_FSM_STATES) {
       const sample = { ...inHide, state: s };
       const same = transitionGameFsm(sample, { type: 'GO_PERMISSION' });
@@ -271,8 +321,8 @@ describe('Game FSM: 100% state & transition coverage', () => {
     ).toBe('COMPUTER_GUESS');
   });
 
-  it('supports Phase 2 rule engine target score, AI guess payloads, and match winner lifecycle', () => {
-    let ctx = createInitialGameContext({ targetScore: 2 });
+  it('supports Phase 2/3 rule engine target score, AI guess payloads, traditional-team pooch/gol, and Level 5 best-of-3 series', async () => {
+    let ctx = createInitialGameContext({ targetScore: 2, enableTurnAlternation: false });
     ctx = transitionGameFsm(ctx, { type: 'GO_PERMISSION' });
     ctx = transitionGameFsm(ctx, { type: 'CAMERA_READY' });
     ctx = transitionGameFsm(ctx, { type: 'CALIBRATION_COMPLETE' });
@@ -300,7 +350,6 @@ describe('Game FSM: 100% state & transition coverage', () => {
     expect(ctx.state).toBe('ROUND_RESULT');
     expect(ctx.computerScore).toBe(1);
     expect(ctx.matchWinner).toBeNull();
-    expect(ctx.ruleHiderOwner).toBe('COMPUTER');
 
     // Second round: computer wins again and reaches targetScore=2
     ctx = transitionGameFsm(ctx, { type: 'NEXT_ROUND' });
@@ -320,5 +369,62 @@ describe('Game FSM: 100% state & transition coverage', () => {
     expect(ctx.computerScore).toBe(0);
     expect(ctx.humanScore).toBe(0);
     expect(ctx.matchWinner).toBeNull();
+
+    // Level 5 Best-of-3 series across classic-1v1 and traditional-team
+    let lvl5 = createInitialGameContext();
+    lvl5 = transitionGameFsm(lvl5, { type: 'ENTER_PRACTICE_MENU' });
+    lvl5 = transitionGameFsm(lvl5, { type: 'SELECT_LEVEL', levelId: 5 });
+    lvl5 = transitionGameFsm(lvl5, { type: 'SET_TARGET_SCORE', targetScore: 2 });
+    expect(lvl5.bestOfMatches).toBe(3);
+    expect(lvl5.ruleSet.id).toBe('classic-1v1');
+
+    const env1 = await createCommitEnvelope(0, 2);
+    lvl5 = transitionGameFsm(lvl5, {
+      type: 'START_GAME',
+      initialHider: 'COMPUTER',
+      computerHideSetup: {
+        secretGolHandIndex: 0,
+        commitPublic: env1.publicInfo,
+        commitSecret: env1.secret,
+      },
+    });
+    lvl5 = transitionGameFsm(lvl5, { type: 'COMPUTER_SHUFFLE_DONE' });
+    // Human guesses wrong twice -> computer wins sub-match 1 (target=2)
+    lvl5 = transitionGameFsm(lvl5, { type: 'HUMAN_GUESS_CALL', handIndex: 1, callType: 'GOL' });
+    expect(lvl5.computerScore).toBe(1);
+    lvl5 = transitionGameFsm(lvl5, {
+      type: 'NEXT_ROUND',
+      computerHideSetup: {
+        secretGolHandIndex: 0,
+        commitPublic: env1.publicInfo,
+        commitSecret: env1.secret,
+      },
+    });
+    lvl5 = transitionGameFsm(lvl5, { type: 'COMPUTER_SHUFFLE_DONE' });
+    lvl5 = transitionGameFsm(lvl5, { type: 'HUMAN_GUESS_CALL', handIndex: 1, callType: 'GOL' });
+    expect(lvl5.matchWinner).toBe('COMPUTER');
+    expect(lvl5.seriesComputerWins).toBe(1);
+    expect(lvl5.seriesWinner).toBeNull();
+
+    // Advancing to sub-match 2 switches ruleSet to traditional-team!
+    const envTeam = await createCommitEnvelope(2, 4);
+    lvl5 = transitionGameFsm(lvl5, {
+      type: 'NEXT_ROUND',
+      computerHideSetup: {
+        secretGolHandIndex: 2,
+        commitPublic: envTeam.publicInfo,
+        commitSecret: envTeam.secret,
+      },
+    });
+    expect(lvl5.seriesMatchIndex).toBe(1);
+    expect(lvl5.ruleSet.id).toBe('traditional-team');
+    expect(lvl5.matchWinner).toBeNull();
+    lvl5 = transitionGameFsm(lvl5, { type: 'COMPUTER_SHUFFLE_DONE' });
+    // Direct gol call on hand 2 awards +2 -> wins sub-match 2 immediately (target=2)
+    lvl5 = transitionGameFsm(lvl5, { type: 'HUMAN_GUESS_CALL', handIndex: 2, callType: 'GOL' });
+    expect(lvl5.matchWinner).toBe('HUMAN');
+    expect(lvl5.seriesHumanWins).toBe(1);
+    expect(lvl5.seriesComputerWins).toBe(1);
+    expect(lvl5.seriesWinner).toBeNull();
   });
 });
