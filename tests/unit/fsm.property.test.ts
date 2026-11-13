@@ -30,6 +30,7 @@ const eventArb: fc.Arbitrary<GameEvent> = fc.oneof(
   fc.constant<GameEvent>({ type: 'OPEN_LEVEL_SELECT' }),
   fc.constant<GameEvent>({ type: 'OPEN_STATS' }),
   fc.constant<GameEvent>({ type: 'OPEN_RULES' }),
+  fc.constant<GameEvent>({ type: 'OPEN_CONSENT' }),
   fc.record({
     type: fc.constant<'SELECT_LEVEL'>('SELECT_LEVEL'),
     levelId: fc.constantFrom<LevelId>(1, 2, 3, 4, 5),

@@ -48,6 +48,11 @@ describe('Game FSM: 100% state & transition coverage (Phases 1-3)', () => {
     ctx = transitionGameFsm(ctx, { type: 'EXIT_TO_MENU' });
     expect(ctx.state).toBe('MENU');
 
+    ctx = transitionGameFsm(ctx, { type: 'OPEN_CONSENT' });
+    expect(ctx.state).toBe('CONSENT');
+    ctx = transitionGameFsm(ctx, { type: 'EXIT_TO_MENU' });
+    expect(ctx.state).toBe('MENU');
+
     // Re-entering calibration and exiting back to menu once calibrated
     ctx = transitionGameFsm(ctx, { type: 'OPEN_CALIBRATION' });
     expect(ctx.state).toBe('CALIBRATION');
@@ -302,7 +307,7 @@ describe('Game FSM: 100% state & transition coverage (Phases 1-3)', () => {
       expect(exited.state).toBe('MENU');
     }
 
-    expect(ALL_FSM_STATES.length).toBe(17);
+    expect(ALL_FSM_STATES.length).toBe(18);
     for (const s of ALL_FSM_STATES) {
       const sample = { ...inHide, state: s };
       const same = transitionGameFsm(sample, { type: 'GO_PERMISSION' });

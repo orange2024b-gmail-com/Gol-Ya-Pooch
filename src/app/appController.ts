@@ -1,6 +1,6 @@
 import type { RoundBehaviorRecord } from '../ai/behavior/types';
 import { HedgeEnsemble } from '../ai/ensemble';
-import { makeFinalGuess } from '../ai/guesser';
+import { makeFinalGuess, type FinalGuessResult } from '../ai/guesser';
 import {
   chooseComputerHidingHand,
   generateHidingChoreography,
@@ -39,7 +39,22 @@ import {
   createDefaultProgressionState,
   type PlayerProgressionState,
 } from '../storage/progressionStore';
+import {
+  IndexedDbRoundLogStore,
+  createDefaultConsentSettings,
+  type ConsentSettings,
+  type RoundLogRecord,
+} from '../storage/roundLogStore';
 import { BeliefFilter, type BeliefState } from '../tracking/beliefFilter';
+import {
+  TEMPORAL_SAMPLE_RATE_HZ,
+  extractFrameFeatureVector,
+  resampleHidingFeatures,
+} from '../tracking/temporalFeatures';
+import {
+  TemporalModelRunner,
+  type TemporalPredictionResult,
+} from '../tracking/temporalModel';
 import { FeatureExtractor, type FrameFeatures } from '../vision/features';
 import {
   PinchConfirmationTracker,
@@ -91,10 +106,22 @@ export class GolYaPoochApp {
   private readonly ensemble = new HedgeEnsemble();
   private readonly profileStore = new IndexedDbProfileStore();
   private readonly progressionStore = new IndexedDbProgressionStore();
+  private readonly roundLogStore = new IndexedDbRoundLogStore();
+  private readonly temporalModel = new TemporalModelRunner();
   private readonly recorder = new SessionRecorder();
 
   private progression: PlayerProgressionState = createDefaultProgressionState();
+  private consentSettings: ConsentSettings = createDefaultConsentSettings();
+  private loggedRoundsCount = 0;
+  private lastLogExportJson: string | null = null;
+  private logNoticeFa: string | null = null;
+  private logNoticeError = false;
   private behaviorHistory: RoundBehaviorRecord[] = [];
+  private hidingFeatureFrames: FrameFeatures[] = [];
+  private hidingStartedAtMs = 0;
+  private lastGuessResult: FinalGuessResult | null = null;
+  private lastTemporalPred: TemporalPredictionResult | null = null;
+  private resolvingHidingGuess = false;
   private videoEl!: HTMLVideoElement;
   private overlayCanvas!: HTMLCanvasElement;
   private overlayCtx!: CanvasRenderingContext2D;
@@ -157,18 +184,30 @@ export class GolYaPoochApp {
     this.bindGlobalListeners();
     this.renderUi();
     void this.loadStoredState();
+    void this.initTemporalModel();
+  }
+
+  private async initTemporalModel(): Promise<void> {
+    await this.temporalModel.init();
+    if (this.showDebug) {
+      this.renderDebugPanel();
+    }
   }
 
   private async loadStoredState(): Promise<void> {
-    const [profile, prog] = await Promise.all([
+    const [profile, prog, consent, logCount] = await Promise.all([
       this.profileStore.loadProfile(DEFAULT_PROFILE_ID),
       this.progressionStore.load(DEFAULT_PROFILE_ID),
+      this.roundLogStore.getConsentSettings(DEFAULT_PROFILE_ID),
+      this.roundLogStore.getRoundLogCount(DEFAULT_PROFILE_ID),
     ]);
     if (profile) {
       this.ensemble.restore(profile.ensemble);
       this.behaviorHistory = profile.history;
     }
     this.progression = prog;
+    this.consentSettings = consent;
+    this.loggedRoundsCount = logCount;
     this.ctx = transitionGameFsm(this.ctx, {
       type: 'SELECT_LEVEL',
       levelId: prog.selectedLevelId,
@@ -178,6 +217,7 @@ export class GolYaPoochApp {
       this.ctx.state === 'MENU' ||
       this.ctx.state === 'LEVEL_SELECT' ||
       this.ctx.state === 'STATS' ||
+      this.ctx.state === 'CONSENT' ||
       this.showDebug
     ) {
       this.renderUi();
@@ -326,21 +366,199 @@ export class GolYaPoochApp {
     }
   }
 
-  private computeAiGuess(): AiGuessPayload {
+  private computeAiGuess(temporalPred: TemporalPredictionResult | null = null): AiGuessPayload {
     const snapshot = this.beliefFilter.getSnapshot();
     const obsQuality = this.beliefFilter.getObservationQuality();
     const behaviorPred = this.ensemble.predict(this.behaviorHistory);
+    const modelStatus = this.temporalModel.getStatus();
     const result = makeFinalGuess({
       belief: snapshot,
       observationQuality: obsQuality,
       behavior: behaviorPred,
+      temporal: temporalPred,
+      temporalFusionWeights: modelStatus.fusionConfig.fusionWeights,
     });
+    this.lastGuessResult = result;
     return {
       guess: result.guess,
       probability: result.probability,
       explanationFa: result.explanationFa,
       timelineEvents: result.timelineDescriptionsFa,
     };
+  }
+
+  private async computeAiGuessAsync(): Promise<AiGuessPayload> {
+    const initialSide = this.ctx.initialShownHand ?? 'LEFT';
+    if (!this.temporalModel.isReady) {
+      await this.temporalModel.init();
+    }
+    const temporalPred = await this.temporalModel.predict(
+      this.hidingFeatureFrames,
+      initialSide
+    );
+    this.lastTemporalPred = temporalPred;
+    return this.computeAiGuess(temporalPred);
+  }
+
+  private async resolveHidingAndFinish(
+    contactCount: number,
+    proceedToRevealAfter = false
+  ): Promise<void> {
+    if (this.resolvingHidingGuess) return;
+    this.resolvingHidingGuess = true;
+    try {
+      const aiGuess = await this.computeAiGuessAsync();
+      if (this.ctx.state === 'HIDING') {
+        this.dispatch({
+          type: 'FINISH_HIDING',
+          aiGuess,
+          contactCount,
+        });
+        if (proceedToRevealAfter) {
+          this.dispatch({ type: 'PROCEED_TO_REVEAL' });
+        }
+      }
+    } finally {
+      this.resolvingHidingGuess = false;
+    }
+  }
+
+  private persistVerifiedHumanHidesRound(verifiedHand: 'LEFT' | 'RIGHT'): void {
+    if (!this.consentSettings.consentEnabled) return;
+
+    const initialSide = this.ctx.initialShownHand ?? 'LEFT';
+    const frames = this.hidingFeatureFrames;
+    const resampled = resampleHidingFeatures(frames, initialSide);
+    const rawFrameFeatures = frames.map((f, idx) => ({
+      tMs: f.timestampMs,
+      v: extractFrameFeatureVector(
+        f,
+        initialSide,
+        frames.length <= 1 ? 0 : idx / (frames.length - 1)
+      ),
+    }));
+
+    const snap = this.beliefFilter.getSnapshot();
+    const guessRes = this.lastGuessResult;
+    const hidingDurationMs = Math.max(
+      resampled.durationMs,
+      performance.now() - this.hidingStartedAtMs
+    );
+
+    const record: RoundLogRecord = {
+      schemaVersion: 1,
+      id: `rl-${Date.now()}-${this.ctx.roundNumber}`,
+      profileId: DEFAULT_PROFILE_ID,
+      recordedAtMs: Date.now(),
+      levelId: this.ctx.levelId,
+      ruleSetId: this.ctx.ruleSet.id,
+      initialShownHand: initialSide,
+      resampledSequence: resampled.matrix,
+      rawFrameFeatures,
+      eventTimeline: snap.timeline,
+      beliefTrace: snap.trace,
+      finalGuess: {
+        guess: guessRes?.guess ?? this.ctx.computerGuess ?? 'LEFT',
+        probability: guessRes?.probability ?? this.ctx.computerGuessProb ?? 0.5,
+        pLeft: guessRes?.pLeft ?? 0.5,
+        hmmPLeft: guessRes?.hmmPLeft ?? snap.pLeft,
+        temporalPLeft: guessRes?.temporalPLeft ?? null,
+        behaviorPLeft: guessRes?.behaviorPLeft ?? 0.5,
+        dominantSource: guessRes?.dominantSource ?? 'TRACKING',
+      },
+      verifiedGroundTruth: verifiedHand,
+      timings: {
+        hidingDurationMs,
+        frameCount: frames.length,
+        sampleRateHz: TEMPORAL_SAMPLE_RATE_HZ,
+        temporalInferenceMs: guessRes?.temporalInferenceMs ?? null,
+        totalProcessingMs: this.inferenceMs,
+      },
+    };
+
+    void this.roundLogStore.appendRoundLog(record).then(async (saved) => {
+      if (saved) {
+        this.loggedRoundsCount = await this.roundLogStore.getRoundLogCount(DEFAULT_PROFILE_ID);
+        if (this.ctx.state === 'ROUND_RESULT' || this.ctx.state === 'STATS' || this.ctx.state === 'CONSENT') {
+          this.renderPanel();
+        }
+      }
+    });
+  }
+
+  private async handleToggleConsent(enabled: boolean): Promise<void> {
+    this.consentSettings = await this.roundLogStore.setConsentEnabled(
+      enabled,
+      DEFAULT_PROFILE_ID
+    );
+    this.logNoticeError = false;
+    this.logNoticeFa = enabled
+      ? 'ثبت محلی داده‌های عددی فعال شد. تنها ویژگی‌های عددی و رویدادها ذخیره می‌شوند.'
+      : 'ثبت داده غیرفعال شد. هیچ دور جدیدی ذخیره نمی‌شود.';
+    this.renderPanel();
+  }
+
+  private async handleExportLogs(): Promise<void> {
+    try {
+      const json = await this.roundLogStore.exportLogsJson(DEFAULT_PROFILE_ID, true);
+      this.lastLogExportJson = json;
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `gol-ya-pooch-logs-${Date.now()}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+
+      const count = await this.roundLogStore.getRoundLogCount(DEFAULT_PROFILE_ID);
+      this.loggedRoundsCount = count;
+      this.logNoticeError = false;
+      this.logNoticeFa = `خروجی JSON با موفقیت آماده شد (${toPersianDigits(count)} دور عددی، بدون تصویر/ویدیو).`;
+    } catch (err) {
+      this.logNoticeError = true;
+      this.logNoticeFa = `خطا در خروجی JSON: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    this.renderPanel();
+  }
+
+  private async handleImportLogs(file: File): Promise<void> {
+    try {
+      const text = await file.text();
+      const res = await this.roundLogStore.importLogsJson(text, {
+        profileIdOverride: DEFAULT_PROFILE_ID,
+      });
+      this.loggedRoundsCount = await this.roundLogStore.getRoundLogCount(DEFAULT_PROFILE_ID);
+      this.logNoticeError = false;
+      this.logNoticeFa = `${toPersianDigits(res.importedCount)} دور وارد شد (${toPersianDigits(res.skippedDuplicates)} تکراری نادیده گرفته شد).`;
+    } catch (err) {
+      this.logNoticeError = true;
+      this.logNoticeFa = `فایل نامعتبر یا دارای داده غیرعددی رد شد: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    this.renderPanel();
+  }
+
+  private async handleClearLogs(): Promise<void> {
+    await this.roundLogStore.clearLogs(DEFAULT_PROFILE_ID);
+    this.loggedRoundsCount = 0;
+    this.lastLogExportJson = null;
+    this.logNoticeError = false;
+    this.logNoticeFa = 'تمام لاگ‌های عددی ثبت‌شده پاک شدند.';
+    this.renderPanel();
+  }
+
+  private async runDebugOnnxBenchmark(): Promise<void> {
+    await this.temporalModel.init();
+    let frames = this.hidingFeatureFrames;
+    let initialSide = this.ctx.initialShownHand ?? 'LEFT';
+    if (frames.length === 0) {
+      const sample = replayRecordedSession(createPhase2TransferSampleSession(), {
+        requiredPinchFrames: 15,
+      });
+      frames = sample.frames.slice(18, -1).map((f) => f.features);
+      initialSide = sample.confirmedSide ?? 'LEFT';
+    }
+    this.lastTemporalPred = await this.temporalModel.predict(frames, initialSide);
+    this.renderDebugPanel();
   }
 
   private async prepareComputerHidesRound(): Promise<void> {
@@ -492,7 +710,7 @@ export class GolYaPoochApp {
   private dispatch(event: GameEvent): void {
     const prevState = this.ctx.state;
 
-    // Record behavioral feedback when a human-hides round completes
+    // Record behavioral feedback & consent-gated numeric round log when a human-hides round completes
     if (
       prevState === 'REVEAL_VERIFY' &&
       event.type === 'REVEAL_VERIFIED' &&
@@ -509,6 +727,7 @@ export class GolYaPoochApp {
         humanWon: event.outcome !== this.ctx.computerGuess,
       });
       void this.saveBehaviorProfile();
+      this.persistVerifiedHumanHidesRound(event.outcome);
     }
 
     if (event.type === 'SELECT_LEVEL') {
@@ -536,6 +755,10 @@ export class GolYaPoochApp {
         this.lastCommitVerification = null;
       } else if (this.ctx.state === 'HIDING') {
         this.featureExtractor.reset();
+        this.hidingFeatureFrames = [];
+        this.hidingStartedAtMs = performance.now();
+        this.lastGuessResult = null;
+        this.resolvingHidingGuess = false;
         this.lastBelief = this.beliefFilter.init(
           this.ctx.initialShownHand ?? 'LEFT',
           this.lastHands?.timestampMs ?? performance.now()
@@ -628,7 +851,8 @@ export class GolYaPoochApp {
       this.ctx.state !== 'CAMERA_ERROR' &&
       this.ctx.state !== 'LEVEL_SELECT' &&
       this.ctx.state !== 'STATS' &&
-      this.ctx.state !== 'RULES'
+      this.ctx.state !== 'RULES' &&
+      this.ctx.state !== 'CONSENT'
     );
   }
 
@@ -782,6 +1006,9 @@ export class GolYaPoochApp {
         }
       } else if (this.ctx.state === 'HIDING') {
         this.lastBelief = this.beliefFilter.update(this.lastFeatures);
+        if (this.hidingFeatureFrames.length < 900) {
+          this.hidingFeatureFrames.push(this.lastFeatures);
+        }
         this.lastPinchObs = [];
       } else if (this.ctx.state === 'REVEAL_VERIFY' && this.golColorModel) {
         const reveal = verifyRevealHands(
@@ -833,12 +1060,15 @@ export class GolYaPoochApp {
       const willTimeoutHide =
         this.ctx.state === 'HIDING' && this.ctx.phaseRemainingMs - dtMs <= 0;
       const contactCount = this.ctx.state === 'HIDING' ? this.getCurrentContactCount() : 0;
+      if (willTimeoutHide) {
+        void this.resolveHidingAndFinish(contactCount);
+        return;
+      }
       this.dispatch({
         type: 'TICK',
         dtMs,
         maxLostDurationMs: this.lastHands?.maxLostDurationMs ?? 0,
         ...(this.ctx.state === 'HIDING' ? { contactCount } : {}),
-        ...(willTimeoutHide ? { aiGuess: this.computeAiGuess() } : {}),
       });
     } else {
       this.updateLiveOverlay();
@@ -913,6 +1143,7 @@ export class GolYaPoochApp {
 
     let idx = 0;
     this.replayTimerId = window.setInterval(() => {
+      if (this.resolvingHidingGuess) return;
       const frame = summary.frames[idx];
       if (!frame) {
         this.stopReplay();
@@ -944,13 +1175,13 @@ export class GolYaPoochApp {
         this.dispatch({ type: 'PINCH_CONFIRMED', side: frame.pinchState.confirmedSide });
       } else if (this.ctx.state === 'HIDING') {
         this.lastBelief = this.beliefFilter.update(frame.features);
+        if (this.hidingFeatureFrames.length < 900) {
+          this.hidingFeatureFrames.push(frame.features);
+        }
         if (idx >= summary.frames.length - 2) {
-          this.dispatch({
-            type: 'FINISH_HIDING',
-            aiGuess: this.computeAiGuess(),
-            contactCount: this.getCurrentContactCount(),
-          });
-          this.dispatch({ type: 'PROCEED_TO_REVEAL' });
+          idx += 1;
+          void this.resolveHidingAndFinish(this.getCurrentContactCount(), true);
+          return;
         }
       }
 
@@ -1125,7 +1356,7 @@ export class GolYaPoochApp {
 
     this.topbarStatusEl.textContent = inGame
       ? `سطح ${toPersianDigits(lvl.id)} (${lvl.nameFa}) | دور ${toPersianDigits(this.ctx.roundNumber)} | شما ${toPersianDigits(this.ctx.humanScore)} - ${toPersianDigits(this.ctx.computerScore)} رایانه`
-      : `فاز ۳ — سطح ${toPersianDigits(lvl.id)}: ${lvl.nameFa} (${this.ctx.ruleSet.nameFa})`;
+      : `فاز ۴ — سطح ${toPersianDigits(lvl.id)}: ${lvl.nameFa} (${this.ctx.ruleSet.nameFa})`;
 
     this.renderPanel();
     this.renderDebugPanel();
@@ -1410,13 +1641,20 @@ export class GolYaPoochApp {
         rulesBtn.setAttribute('data-testid', 'menu-rules-btn');
         rulesBtn.addEventListener('click', () => this.dispatch({ type: 'OPEN_RULES' }));
 
+        const consentBtn = document.createElement('button');
+        consentBtn.type = 'button';
+        consentBtn.className = 'btn btn-secondary';
+        consentBtn.textContent = FA.menuConsentBtn;
+        consentBtn.setAttribute('data-testid', 'menu-consent-btn');
+        consentBtn.addEventListener('click', () => this.dispatch({ type: 'OPEN_CONSENT' }));
+
         const calBtn = document.createElement('button');
         calBtn.type = 'button';
         calBtn.className = 'btn btn-secondary';
         calBtn.textContent = FA.menuRecalibrateBtn;
         calBtn.addEventListener('click', () => this.dispatch({ type: 'OPEN_CALIBRATION' }));
 
-        btnRow.append(playBtn, levelsBtn, statsBtn, rulesBtn, calBtn);
+        btnRow.append(playBtn, levelsBtn, statsBtn, rulesBtn, consentBtn, calBtn);
 
         const targetWrap = document.createElement('div');
         targetWrap.style.marginTop = '14px';
@@ -1442,6 +1680,17 @@ export class GolYaPoochApp {
         settingsHeading.textContent = FA.menuSettingsHeading;
 
         const settingsBox = document.createElement('div');
+        const consentRow = this.makeToggleRow(
+          FA.consentToggleLabel,
+          this.consentSettings.consentEnabled,
+          (val) => {
+            void this.handleToggleConsent(val);
+          }
+        );
+        consentRow
+          .querySelector('input')
+          ?.setAttribute('data-testid', 'settings-consent-toggle');
+
         settingsBox.append(
           this.makeToggleRow(FA.calMirrorToggle, this.mirrored, (val) => {
             this.mirrored = val;
@@ -1458,14 +1707,25 @@ export class GolYaPoochApp {
           this.makeToggleRow(FA.debugToggleLabel, this.showDebug, (val) => {
             this.showDebug = val;
             this.renderDebugPanel();
-          })
+          }),
+          consentRow
         );
 
         const memRow = document.createElement('div');
         memRow.className = 'btn-row';
         const memStat = document.createElement('span');
         memStat.className = 'check-hint';
-        memStat.textContent = `دورهای ثبت‌شده: ${toPersianDigits(this.progression.totalRoundsPlayed)} | بالاترین سطح باز: ${toPersianDigits(this.progression.unlockedMaxLevel)}`;
+        memStat.textContent = `دورهای ثبت‌شده: ${toPersianDigits(this.progression.totalRoundsPlayed)} | لاگ عددی (فاز ۴): ${toPersianDigits(this.loggedRoundsCount)} (${this.consentSettings.consentEnabled ? 'فعال' : 'پیش‌فرض خاموش'})`;
+
+        const exportLogsBtn = document.createElement('button');
+        exportLogsBtn.type = 'button';
+        exportLogsBtn.className = 'btn btn-secondary btn-compact';
+        exportLogsBtn.textContent = FA.exportLogsBtn;
+        exportLogsBtn.setAttribute('data-testid', 'settings-export-logs-btn');
+        exportLogsBtn.addEventListener('click', () => {
+          void this.handleExportLogs();
+        });
+
         const clearMemBtn = document.createElement('button');
         clearMemBtn.type = 'button';
         clearMemBtn.className = 'btn btn-secondary btn-compact';
@@ -1479,7 +1739,7 @@ export class GolYaPoochApp {
             this.renderUi();
           });
         });
-        memRow.append(memStat, clearMemBtn);
+        memRow.append(memStat, exportLogsBtn, clearMemBtn);
 
         card.append(
           h2,
@@ -1492,6 +1752,13 @@ export class GolYaPoochApp {
           settingsBox,
           memRow
         );
+        if (this.logNoticeFa) {
+          const n = document.createElement('div');
+          n.className = `status-notice${this.logNoticeError ? ' error' : ''}`;
+          n.setAttribute('data-testid', 'log-status-notice');
+          n.textContent = this.logNoticeFa;
+          card.append(n);
+        }
         break;
       }
 
@@ -1614,13 +1881,194 @@ export class GolYaPoochApp {
           levelList.append(li);
         }
 
+        const logCard = document.createElement('div');
+        logCard.className = 'consent-box';
+        logCard.setAttribute('data-testid', 'stats-logs-section');
+        const logTitle = document.createElement('strong');
+        logTitle.textContent = `لاگ‌های عددی یادگیری (فاز ۴): ${toPersianDigits(this.loggedRoundsCount)} دور ثبت‌شده`;
+        const logHint = document.createElement('p');
+        logHint.className = 'check-hint';
+        logHint.textContent = this.consentSettings.consentEnabled
+          ? FA.consentActiveBadge
+          : FA.consentDefaultOffBadge;
+
+        const logBtns = document.createElement('div');
+        logBtns.className = 'btn-row';
+
+        const expBtn = document.createElement('button');
+        expBtn.type = 'button';
+        expBtn.className = 'btn btn-primary btn-compact';
+        expBtn.textContent = FA.exportLogsBtn;
+        expBtn.setAttribute('data-testid', 'stats-export-logs-btn');
+        expBtn.addEventListener('click', () => {
+          void this.handleExportLogs();
+        });
+
+        const impInput = document.createElement('input');
+        impInput.type = 'file';
+        impInput.accept = 'application/json,.json';
+        impInput.className = 'hidden';
+        impInput.addEventListener('change', () => {
+          const f = impInput.files?.[0];
+          if (f) void this.handleImportLogs(f);
+        });
+
+        const impBtn = document.createElement('button');
+        impBtn.type = 'button';
+        impBtn.className = 'btn btn-secondary btn-compact';
+        impBtn.textContent = FA.importLogsBtn;
+        impBtn.setAttribute('data-testid', 'stats-import-logs-btn');
+        impBtn.addEventListener('click', () => impInput.click());
+
+        const clrBtn = document.createElement('button');
+        clrBtn.type = 'button';
+        clrBtn.className = 'btn btn-danger btn-compact';
+        clrBtn.textContent = FA.clearLogsBtn;
+        clrBtn.setAttribute('data-testid', 'stats-clear-logs-btn');
+        clrBtn.addEventListener('click', () => {
+          void this.handleClearLogs();
+        });
+
+        const openConsentBtn = document.createElement('button');
+        openConsentBtn.type = 'button';
+        openConsentBtn.className = 'btn btn-secondary btn-compact';
+        openConsentBtn.textContent = FA.menuConsentBtn;
+        openConsentBtn.setAttribute('data-testid', 'stats-open-consent-btn');
+        openConsentBtn.addEventListener('click', () =>
+          this.dispatch({ type: 'OPEN_CONSENT' })
+        );
+
+        logBtns.append(expBtn, impBtn, clrBtn, openConsentBtn, impInput);
+        logCard.append(logTitle, logHint, logBtns);
+
+        if (this.logNoticeFa) {
+          const n = document.createElement('div');
+          n.className = `status-notice${this.logNoticeError ? ' error' : ''}`;
+          n.setAttribute('data-testid', 'log-status-notice');
+          n.textContent = this.logNoticeFa;
+          logCard.append(n);
+        }
+
         const backBtn = document.createElement('button');
         backBtn.type = 'button';
         backBtn.className = 'btn btn-secondary';
         backBtn.textContent = FA.exitToMenuBtn;
         backBtn.addEventListener('click', () => this.dispatch({ type: 'EXIT_TO_MENU' }));
 
-        card.append(h2, grid, levelList, backBtn);
+        card.append(h2, grid, levelList, logCard, backBtn);
+        break;
+      }
+
+      case 'CONSENT': {
+        card.setAttribute('data-testid', 'consent-screen');
+        const h2 = document.createElement('h2');
+        h2.textContent = FA.consentTitle;
+
+        const statusBadge = document.createElement('div');
+        statusBadge.className = this.consentSettings.consentEnabled
+          ? 'contact-req-pill done'
+          : 'contact-req-pill pending';
+        statusBadge.setAttribute('data-testid', 'consent-status-badge');
+        statusBadge.textContent = this.consentSettings.consentEnabled
+          ? FA.consentActiveBadge
+          : FA.consentDefaultOffBadge;
+
+        const body = document.createElement('p');
+        body.textContent = FA.consentExplanation;
+
+        const checklist = document.createElement('ul');
+        checklist.className = 'checklist';
+        for (const text of FA.consentChecklist) {
+          const li = document.createElement('li');
+          li.className = 'check-item ok';
+          li.textContent = `✓ ${text}`;
+          checklist.append(li);
+        }
+
+        const toggleBox = document.createElement('div');
+        toggleBox.className = 'consent-box';
+        const toggleRow = this.makeToggleRow(
+          FA.consentToggleLabel,
+          this.consentSettings.consentEnabled,
+          (val) => {
+            void this.handleToggleConsent(val);
+          }
+        );
+        toggleRow
+          .querySelector('input')
+          ?.setAttribute('data-testid', 'consent-toggle-checkbox');
+
+        const countInfo = document.createElement('p');
+        countInfo.className = 'check-hint';
+        countInfo.setAttribute('data-testid', 'consent-log-count');
+        countInfo.textContent = `تعداد دورهای عددی ذخیره‌شده در IndexedDB: ${toPersianDigits(this.loggedRoundsCount)}`;
+        toggleBox.append(toggleRow, countInfo);
+
+        const btnRow = document.createElement('div');
+        btnRow.className = 'btn-row';
+
+        const expBtn = document.createElement('button');
+        expBtn.type = 'button';
+        expBtn.className = 'btn btn-primary';
+        expBtn.textContent = FA.exportLogsBtn;
+        expBtn.setAttribute('data-testid', 'consent-export-btn');
+        expBtn.addEventListener('click', () => {
+          void this.handleExportLogs();
+        });
+
+        const impInput = document.createElement('input');
+        impInput.type = 'file';
+        impInput.accept = 'application/json,.json';
+        impInput.className = 'hidden';
+        impInput.setAttribute('data-testid', 'consent-import-input');
+        impInput.addEventListener('change', () => {
+          const f = impInput.files?.[0];
+          if (f) void this.handleImportLogs(f);
+        });
+
+        const impBtn = document.createElement('button');
+        impBtn.type = 'button';
+        impBtn.className = 'btn btn-secondary';
+        impBtn.textContent = FA.importLogsBtn;
+        impBtn.setAttribute('data-testid', 'consent-import-btn');
+        impBtn.addEventListener('click', () => impInput.click());
+
+        const clrBtn = document.createElement('button');
+        clrBtn.type = 'button';
+        clrBtn.className = 'btn btn-danger';
+        clrBtn.textContent = FA.clearLogsBtn;
+        clrBtn.setAttribute('data-testid', 'consent-clear-btn');
+        clrBtn.addEventListener('click', () => {
+          void this.handleClearLogs();
+        });
+
+        const backBtn = document.createElement('button');
+        backBtn.type = 'button';
+        backBtn.className = 'btn btn-secondary';
+        backBtn.textContent = FA.exitToMenuBtn;
+        backBtn.setAttribute('data-testid', 'consent-back-btn');
+        backBtn.addEventListener('click', () => this.dispatch({ type: 'EXIT_TO_MENU' }));
+
+        btnRow.append(expBtn, impBtn, clrBtn, backBtn, impInput);
+        card.append(h2, statusBadge, body, checklist, toggleBox, btnRow);
+
+        if (this.logNoticeFa) {
+          const n = document.createElement('div');
+          n.className = `status-notice${this.logNoticeError ? ' error' : ''}`;
+          n.setAttribute('data-testid', 'log-status-notice');
+          n.textContent = this.logNoticeFa;
+          card.append(n);
+        }
+        if (this.lastLogExportJson) {
+          const pre = document.createElement('pre');
+          pre.className = 'how-it-works-box ltr-inline';
+          pre.style.maxHeight = '120px';
+          pre.style.overflow = 'auto';
+          pre.style.width = '100%';
+          pre.setAttribute('data-testid', 'export-json-preview');
+          pre.textContent = this.lastLogExportJson.slice(0, 600);
+          card.append(pre);
+        }
         break;
       }
 
@@ -1734,13 +2182,9 @@ export class GolYaPoochApp {
           doneBtn.className = 'btn btn-primary';
           doneBtn.textContent = FA.finishHidingBtn;
           doneBtn.setAttribute('data-testid', 'finish-hiding-btn');
-          doneBtn.addEventListener('click', () =>
-            this.dispatch({
-              type: 'FINISH_HIDING',
-              aiGuess: this.computeAiGuess(),
-              contactCount: this.getCurrentContactCount(),
-            })
-          );
+          doneBtn.addEventListener('click', () => {
+            void this.resolveHidingAndFinish(this.getCurrentContactCount());
+          });
           card.append(doneBtn);
         } else if (this.ctx.state === 'COMPUTER_GUESS') {
           const h2 = document.createElement('h2');
@@ -2289,6 +2733,17 @@ export class GolYaPoochApp {
   private getDebugMetricValues(): Array<[string, string]> {
     const belief = this.lastBelief ?? this.beliefFilter.getBelief();
     const behav = this.ensemble.predict(this.behaviorHistory);
+    const ortStatus = this.temporalModel.getStatus();
+    const lastMs = this.lastTemporalPred?.available
+      ? this.lastTemporalPred.inferenceMs
+      : ortStatus.lastInferenceMs;
+    const onnxStr = ortStatus.ready
+      ? `READY (${ortStatus.backend}, ${ortStatus.modelVersion ?? 'v1'})${lastMs !== null ? ` | ${lastMs.toFixed(2)} ms` : ''}${this.lastTemporalPred?.pLeft !== null && this.lastTemporalPred?.pLeft !== undefined ? ` | P(L)=${(this.lastTemporalPred.pLeft * 100).toFixed(1)}%` : ''}`
+      : `FALLBACK (${ortStatus.fallbackReason ?? ortStatus.status})`;
+    const fusionStr = this.lastGuessResult
+      ? `${this.lastGuessResult.temporalUsed ? 'HMM+ONNX' : 'HMM-only'} -> P(L)=${(this.lastGuessResult.trackingPLeft * 100).toFixed(1)}%`
+      : `wHMM=${ortStatus.fusionConfig.fusionWeights.hmmWeight.toFixed(2)}, wONNX=${ortStatus.fusionConfig.fusionWeights.temporalWeight.toFixed(2)}`;
+
     return [
       ['FSM State', `${this.ctx.state} (L${this.ctx.levelId})`],
       ['FPS / Infer', `${this.fps.toFixed(1)} fps / ${this.inferenceMs.toFixed(1)} ms`],
@@ -2314,9 +2769,11 @@ export class GolYaPoochApp {
         'HMM Belief',
         `P(L)=${(belief.pLeft * 100).toFixed(0)}% | P(R)=${(belief.pRight * 100).toFixed(0)}% | conf=${belief.confidence.toFixed(2)}`,
       ],
+      ['ONNX Temporal', onnxStr],
+      ['Fused Tracking', fusionStr],
       [
         'Behavior Prior',
-        `P(L)=${(behav.pLeft * 100).toFixed(0)}% (${this.behaviorHistory.length} rounds)`,
+        `P(L)=${(behav.pLeft * 100).toFixed(0)}% (${this.behaviorHistory.length} rounds) | Logs=${this.loggedRoundsCount} (${this.consentSettings.consentEnabled ? 'ON' : 'OFF'})`,
       ],
       [
         'Commit Hash',
@@ -2486,7 +2943,16 @@ export class GolYaPoochApp {
     loadBtn.textContent = FA.debugLoadJson;
     loadBtn.addEventListener('click', () => fileInput.click());
 
-    btnRow.append(recBtn, sampleBtn, transferBtn, loadBtn, fileInput);
+    const benchOnnxBtn = document.createElement('button');
+    benchOnnxBtn.type = 'button';
+    benchOnnxBtn.className = 'btn btn-secondary btn-compact';
+    benchOnnxBtn.textContent = 'تست استنتاج ONNX';
+    benchOnnxBtn.setAttribute('data-testid', 'debug-run-onnx-btn');
+    benchOnnxBtn.addEventListener('click', () => {
+      void this.runDebugOnnxBenchmark();
+    });
+
+    btnRow.append(recBtn, sampleBtn, transferBtn, loadBtn, benchOnnxBtn, fileInput);
     this.debugContainer.append(title, grid, beliefSection, btnRow);
     this.updateDebugMetricsInPlace();
 

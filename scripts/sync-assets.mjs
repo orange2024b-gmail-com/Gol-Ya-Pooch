@@ -23,4 +23,15 @@ for (const subset of subsets) {
   }
 }
 
-console.log('Synced self-hosted MediaPipe WASM and Vazirmatn font assets to public/.');
+const ortSrc = join(root, 'node_modules', 'onnxruntime-web', 'dist');
+const ortDst = join(root, 'public', 'ort');
+mkdirSync(ortDst, { recursive: true });
+const ortFiles = [
+  'ort-wasm-simd-threaded.wasm',
+  'ort-wasm-simd-threaded.mjs',
+];
+for (const file of ortFiles) {
+  copyFileSync(join(ortSrc, file), join(ortDst, file));
+}
+
+console.log('Synced self-hosted MediaPipe WASM, Vazirmatn fonts, and ORT-Web WASM assets to public/.');

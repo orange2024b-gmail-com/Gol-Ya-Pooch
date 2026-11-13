@@ -27,6 +27,10 @@ jobs:
           test -f public/mediapipe/hand_landmarker.task
           test -f public/mediapipe/wasm/vision_wasm_internal.wasm
           test -f public/fonts/vazirmatn-arabic-400-normal.woff2
+          test -f public/ort/ort-wasm-simd-threaded.wasm
+          test -f public/ort/ort-wasm-simd-threaded.mjs
+          test -f public/models/fusion_config.json
+          test -f public/models/temporal_tracker.onnx
 
       - name: Lint
         run: npm run lint

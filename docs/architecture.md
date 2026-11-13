@@ -1,4 +1,4 @@
-# Gol Ya Pooch Architecture Notes (Phases 1–3)
+# Gol Ya Pooch Architecture Notes (Phases 1–4)
 
 ## Design Goals
 
@@ -34,3 +34,18 @@
     - `traditional-team.json` and `custom.json` extend the schema-validated declarative rule engine (`evaluateGuessCallStep`, `resolveRoundByRules`) with `پوچ` / `گل` multi-guess scoring (`+2`, `+0`, `+1`).
     - Levels 1–4 sample uniformly via unbiased `crypto.getRandomValues` rejection sampling. Level 5 (`استاد گل‌گیر`) runs a Best-of-3 series (`classic-1v1` and `traditional-team`) and pairs an online Hedge human-guesser predictor with a bounded-exploitation best response (`|p_i - 1/K| <= min(0.18, 0.45 / K)`) so the computer stays unpredictable.
     - Level progression and match/round statistics are stored strictly numerically in IndexedDB via `IndexedDbProgressionStore`.
+
+## Phase 4: Consent-Gated Logging, Offline Training & Self-Hosted ONNX Inference
+
+11. **Consent-Gated Numeric Round Logging (`src/storage/roundLogStore.ts`):**
+    - `IndexedDbRoundLogStore` defaults to `consentEnabled: false` and refuses to persist any round until the player opts in via the Persian Consent screen or Settings.
+    - `assertNumericOnlyPayload` recursively rejects any media keys (`image`, `video`, `canvas`, `pixels`, `rgba`, `blob`, `base64`), typed arrays, DOM media objects, or `data:image/` / `data:video/` URIs before IndexedDB storage and during JSON export/import.
+    - Logged rounds record level, rule set, initial hand, 10 Hz resampled `[64 x 24]` feature sequence, raw numeric per-frame vectors, event timeline, HMM belief trace, final guess breakdown, verified ground truth, and timings.
+
+12. **Offline Python 3.11+ Pipeline (`/training/`) & Ship Gate:**
+    - `training/gol_training/` loads exported JSON round logs (or generates a deterministic multi-player dataset), splits strictly by player (`split_by_player` with zero leakage), trains a compact **Conv1D + GRU** temporal tracker (`TemporalTrackerNet`), calibrates logistic fusion weights (`[w_hmm, w_temporal, bias]`) on the validation split, and exports `temporal_tracker.onnx` (31 KB).
+    - **Ship Gate:** `public/models/temporal_tracker.onnx` and `public/models/fusion_config.json` ship only if the fused model strictly beats the HMM filter-only baseline on the held-out player test split.
+
+13. **Browser ONNX Runtime Web WASM Integration (`src/tracking/temporalModel.ts`, `src/ai/guesser.ts`):**
+    - `onnxruntime-web@1.31.1` WASM binaries (`ort-wasm-simd-threaded.wasm`, `ort-wasm-simd-threaded.mjs`) are self-hosted under `public/ort/` and resolved via `document.baseURI` with zero external CDN requests.
+    - `TemporalModelRunner` runs warmup on load, executes inference on the resampled 10 Hz hiding sequence (`< 1 ms` warm in Node/desktop Chromium), and fuses with the HMM belief filter via `fuseHmmAndTemporal`. Any missing, HTML-redirected, corrupt, or ship-gate-failed model automatically falls back to HMM-only without crashing.

@@ -1,6 +1,7 @@
 import { sideLabelFa, toPersianDigits } from '../app/i18n';
 import type { BeliefFilterSnapshot } from '../tracking/beliefFilter';
 import type { TrackingEvent } from '../tracking/eventDetector';
+import type { TemporalFusionWeights, TemporalPredictionResult } from '../tracking/temporalModel';
 import type { HandSide } from '../vision/types';
 import type { EnsemblePrediction } from './ensemble';
 
@@ -16,11 +17,19 @@ export const DEFAULT_FUSION_WEIGHTS: FusionWeights = {
   bias: 0,
 };
 
+export const DEFAULT_TEMPORAL_FUSION_WEIGHTS: TemporalFusionWeights = {
+  hmmWeight: 0.286714,
+  temporalWeight: 0.708812,
+  bias: 0.053959,
+};
+
 export interface GuesserInput {
   belief: BeliefFilterSnapshot;
   observationQuality: number;
   behavior: EnsemblePrediction;
   weights?: Partial<FusionWeights>;
+  temporal?: TemporalPredictionResult | null;
+  temporalFusionWeights?: Partial<TemporalFusionWeights>;
 }
 
 export interface FinalGuessResult {
@@ -29,6 +38,11 @@ export interface FinalGuessResult {
   pLeft: number;
   pRight: number;
   trackingPLeft: number;
+  hmmPLeft: number;
+  temporalPLeft: number | null;
+  temporalUsed: boolean;
+  temporalInferenceMs: number | null;
+  temporalFallbackReason: string | null;
   behaviorPLeft: number;
   trackingConfidence: number;
   observationQuality: number;
@@ -155,20 +169,57 @@ export function buildPersianExplanation(
 }
 
 /**
- * Fuses tracking belief with the behavioral prior via log-odds addition
- * and produces the final guess, probability, and Persian timeline explanation.
+ * Calibrated logistic fusion combining the HMM belief filter and the ONNX temporal model.
+ * Falls back cleanly to `hmmPLeft` when the temporal prediction is unavailable.
+ */
+export function fuseHmmAndTemporal(
+  hmmPLeft: number,
+  temporal: TemporalPredictionResult | null | undefined,
+  weights?: Partial<TemporalFusionWeights>
+): { trackingPLeft: number; temporalUsed: boolean; temporalPLeft: number | null } {
+  if (!temporal || !temporal.available || temporal.pLeft === null) {
+    return {
+      trackingPLeft: clampProb(hmmPLeft),
+      temporalUsed: false,
+      temporalPLeft: null,
+    };
+  }
+  const w: TemporalFusionWeights = { ...DEFAULT_TEMPORAL_FUSION_WEIGHTS, ...weights };
+  const fusedLogit =
+    w.hmmWeight * logit(hmmPLeft) + w.temporalWeight * logit(temporal.pLeft) + w.bias;
+  return {
+    trackingPLeft: clampProb(sigmoid(fusedLogit)),
+    temporalUsed: true,
+    temporalPLeft: clampProb(temporal.pLeft),
+  };
+}
+
+/**
+ * Fuses tracking belief (HMM + optional ONNX temporal model) with the behavioral prior
+ * via log-odds addition and produces the final guess, probability, and Persian explanation.
  */
 export function makeFinalGuess(input: GuesserInput): FinalGuessResult {
   const weights: FusionWeights = { ...DEFAULT_FUSION_WEIGHTS, ...input.weights };
   const obsQuality = Math.max(0, Math.min(1, input.observationQuality));
-  const trackConf = input.belief.confidence;
+
+  const hmmPLeft = clampProb(input.belief.pLeft);
+  const { trackingPLeft, temporalUsed, temporalPLeft } = fuseHmmAndTemporal(
+    hmmPLeft,
+    input.temporal,
+    input.temporalFusionWeights
+  );
+
+  const trackConf = Math.max(
+    input.belief.confidence,
+    temporalUsed ? Math.abs(trackingPLeft - (1 - trackingPLeft)) : 0
+  );
 
   // Tracking dominates when clearly observed; behavior takes over when confidence/quality is low
   const effectiveTrackingWeight = weights.trackingWeight * Math.max(0.15, obsQuality);
   const effectiveBehaviorWeight =
     weights.behaviorWeight * (1 - 0.5 * trackConf * obsQuality);
 
-  const trackLogit = logit(input.belief.pLeft);
+  const trackLogit = logit(trackingPLeft);
   const behavLogit = logit(input.behavior.pLeft);
 
   const trackContrib = effectiveTrackingWeight * trackLogit;
@@ -194,7 +245,14 @@ export function makeFinalGuess(input: GuesserInput): FinalGuessResult {
     probability,
     pLeft,
     pRight,
-    trackingPLeft: input.belief.pLeft,
+    trackingPLeft,
+    hmmPLeft,
+    temporalPLeft,
+    temporalUsed,
+    temporalInferenceMs: temporalUsed ? (input.temporal?.inferenceMs ?? null) : null,
+    temporalFallbackReason: temporalUsed
+      ? null
+      : (input.temporal?.fallbackReason ?? 'HMM filter fallback'),
     behaviorPLeft: input.behavior.pLeft,
     trackingConfidence: trackConf,
     observationQuality: obsQuality,

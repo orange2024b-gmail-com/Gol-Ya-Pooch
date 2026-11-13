@@ -24,6 +24,7 @@ export const ALL_FSM_STATES = [
   'LEVEL_SELECT',
   'STATS',
   'RULES',
+  'CONSENT',
   'SHOW_GOL',
   'HIDING',
   'COMPUTER_GUESS',
@@ -139,6 +140,7 @@ export type GameEvent =
   | { type: 'OPEN_LEVEL_SELECT' }
   | { type: 'OPEN_STATS' }
   | { type: 'OPEN_RULES' }
+  | { type: 'OPEN_CONSENT' }
   | {
       type: 'SELECT_LEVEL';
       levelId: LevelId;
@@ -615,6 +617,9 @@ export function transitionGameFsm(ctx: GameContext, event: GameEvent): GameConte
       if (event.type === 'OPEN_RULES') {
         return { ...ctx, state: 'RULES' };
       }
+      if (event.type === 'OPEN_CONSENT') {
+        return { ...ctx, state: 'CONSENT' };
+      }
       if (event.type === 'START_GAME') {
         if (!ctx.calibrated && !ctx.practiceMode) {
           return { ...ctx, state: 'CALIBRATION' };
@@ -633,9 +638,13 @@ export function transitionGameFsm(ctx: GameContext, event: GameEvent): GameConte
 
     case 'LEVEL_SELECT':
     case 'STATS':
-    case 'RULES': {
+    case 'RULES':
+    case 'CONSENT': {
       if (event.type === 'EXIT_TO_MENU') {
         return { ...ctx, state: 'MENU' };
+      }
+      if (event.type === 'OPEN_CONSENT' && ctx.state === 'STATS') {
+        return { ...ctx, state: 'CONSENT' };
       }
       if (event.type === 'START_GAME' && ctx.state === 'LEVEL_SELECT') {
         if (!ctx.calibrated && !ctx.practiceMode) {
