@@ -324,7 +324,11 @@ export function chooseComputerHidingHand(
 
   // Strictly bound deviation |p_i - 1/K| <= effectiveMaxDev < 1/K so computer stays unpredictable
   const effectiveMaxDev = Math.min(level.maxExploitDeviation, 0.45 / handsCount);
-  const maxMixWeight = effectiveMaxDev / Math.max(1e-6, 1 - uniformVal);
+  let maxAntiDev = 0;
+  for (const a of antiDist) {
+    maxAntiDev = Math.max(maxAntiDev, Math.abs(a - uniformVal));
+  }
+  const maxMixWeight = maxAntiDev > 1e-6 ? Math.min(1, effectiveMaxDev / maxAntiDev) : 0;
   const mixWeight = exploitStrength * maxMixWeight;
 
   const probabilities = normalizeProbs(

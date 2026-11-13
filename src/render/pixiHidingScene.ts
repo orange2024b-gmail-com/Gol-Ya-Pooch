@@ -405,14 +405,14 @@ export class PixiHidingScene {
         style: labelStyle,
       });
       labelText.anchor.set(0.5, 0);
-      labelText.position.set(0, 56);
+      labelText.position.set(0, 70);
 
       const statusText = new Text({
         text: '',
         style: statusStyle,
       });
       statusText.anchor.set(0.5, 1);
-      statusText.position.set(0, -48);
+      statusText.position.set(0, -72);
 
       container.addChild(bgGlow, closedArt, openArt, golArt, labelText, statusText);
 
