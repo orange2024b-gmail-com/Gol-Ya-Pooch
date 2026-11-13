@@ -1,0 +1,33 @@
+{
+  "id": "classic-1v1",
+  "version": 1,
+  "nameFa": "کلاسیک دو نفره",
+  "nameEn": "Classic 1v1",
+  "descriptionFa": "دو دست، یک پنهان‌کننده و یک حدس‌زننده. حدس درست +۱ امتیاز و تغییر نوبت؛ حدس اشتباه +۱ امتیاز برای پنهان‌کننده و تکرار نوبت.",
+  "handsCount": 2,
+  "targetScore": 7,
+  "maxGuessesPerRound": 1,
+  "allowPoochCalls": false,
+  "scoring": {
+    "correctGolNoWrongCalls": 1,
+    "correctGolAfterPoochCalls": 1,
+    "wrongGuessOrOutOfGuessesHiderPoints": 1,
+    "voidRoundPoints": 0
+  },
+  "turnPolicy": {
+    "passTurnOnCorrectGuess": true,
+    "keepTurnOnWrongGuess": true
+  },
+  "timeoutsMs": {
+    "showGol": 12000,
+    "hiding": 10000,
+    "guessDisplay": 2500,
+    "revealVerify": 10000
+  },
+  "voidConditions": {
+    "maxHandLostMs": 500,
+    "voidOnRevealNeither": true,
+    "voidOnRevealBoth": true,
+    "voidOnTimeout": true
+  }
+}

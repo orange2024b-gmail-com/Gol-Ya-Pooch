@@ -1,3 +1,5 @@
+import type { FrameFeatures } from './features';
+
 export type HandSide = 'LEFT' | 'RIGHT';
 
 export interface Landmark {
@@ -171,7 +173,7 @@ export interface RecordedFrame {
     QualityReport,
     'meanLuminance' | 'contrastStd' | 'blurScore' | 'lightingOk' | 'distanceOk'
   >;
-  features?: import('./features').FrameFeatures;
+  features?: FrameFeatures;
   pinch?: RecordedPinchSummary[];
   reveal?: RecordedRevealSummary;
 }

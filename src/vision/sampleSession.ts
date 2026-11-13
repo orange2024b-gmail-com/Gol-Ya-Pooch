@@ -1,10 +1,11 @@
+import { FeatureExtractor } from './features';
 import { HandIdentityTracker } from './handTracker';
 import { SessionRecorder } from './recorder';
 import type { Landmark, RecordedSession } from './types';
 
 function makeQuickPose(
   wrist: { x: number; y: number },
-  posture: 'open' | 'pinch' | 'fist',
+  posture: 'open' | 'pinch' | 'fist' | 'half-open',
   mirrorX = false
 ): Landmark[] {
   const dir = mirrorX ? -1 : 1;
@@ -32,6 +33,15 @@ function makeQuickPose(
       pt(0, -0.88), pt(0, -1.26), pt(0, -1.54), pt(0, -1.78),
       pt(0.22, -0.82), pt(0.25, -1.18), pt(0.27, -1.44), pt(0.29, -1.66),
       pt(0.42, -0.7), pt(0.47, -0.98), pt(0.51, -1.18), pt(0.55, -1.36),
+    ];
+  }
+  if (posture === 'half-open') {
+    return [
+      pt(0, 0), pt(-0.21, -0.18), pt(-0.34, -0.38), pt(-0.38, -0.55), pt(-0.36, -0.66),
+      pt(-0.2, -0.81), pt(-0.21, -0.98), pt(-0.21, -1.05), pt(-0.2, -0.98),
+      pt(0, -0.86), pt(0, -1.02), pt(0, -1.1), pt(0, -1.02),
+      pt(0.2, -0.81), pt(0.21, -0.98), pt(0.21, -1.05), pt(0.2, -0.98),
+      pt(0.38, -0.69), pt(0.4, -0.82), pt(0.41, -0.88), pt(0.4, -0.82),
     ];
   }
   return [
@@ -134,6 +144,132 @@ export function createBuiltInSampleSession(): RecordedSession {
         outcome: 'LEFT',
         leftGolDetected: true,
         rightGolDetected: false,
+      },
+    });
+  }
+
+  return recorder.stop();
+}
+
+/**
+ * Generates a Phase 2 transfer sample session:
+ * - Frames 0..17: Show gol in LEFT pinch
+ * - Frames 18..35: Hands apart in closed fists
+ * - Frames 36..62: Hands meet in contact; LEFT briefly half-opens (handover), RIGHT tightens
+ * - Frames 63..84: Hands separate; gol revealed in RIGHT
+ */
+export function createPhase2TransferSampleSession(): RecordedSession {
+  const tracker = new HandIdentityTracker();
+  const extractor = new FeatureExtractor();
+  const recorder = new SessionRecorder();
+  recorder.start({
+    source: 'synthetic',
+    notes: 'Phase 2 transfer sample session: LEFT pinch -> contact + partial opening -> RIGHT reveal',
+  });
+
+  const baseQuality = {
+    meanLuminance: 136,
+    contrastStd: 36,
+    blurScore: 115,
+    lightingOk: true,
+    lightingHintFa: null,
+    blurOk: true,
+    bothHandsDetected: true,
+    minHandConfidence: 0.93,
+    confidenceOk: true,
+    distanceOk: true,
+    distanceHintFa: null,
+  };
+
+  for (let f = 0; f < 18; f++) {
+    const ts = f * 33;
+    const rawDetections = [
+      { landmarks: makeQuickPose({ x: 0.3, y: 0.7 }, 'pinch'), handedness: 'LEFT' as const, handednessScore: 0.95 },
+      { landmarks: makeQuickPose({ x: 0.7, y: 0.7 }, 'open', true), handedness: 'RIGHT' as const, handednessScore: 0.94 },
+    ];
+    const hands = tracker.update(rawDetections, ts);
+    const features = extractor.update({ hands, quality: baseQuality });
+    recorder.recordFrame({
+      timestampMs: ts,
+      rawDetections,
+      hands,
+      quality: baseQuality,
+      features,
+      pinch: [
+        {
+          side: 'LEFT',
+          pinchPostureOk: true,
+          pinchDistanceNorm: 0.14,
+          roiCenter: { x: 0.27, y: 0.54 },
+          roiRadiusNorm: 0.05,
+          blob: { matchRatio: 0.44, compactness: 0.8, matchedPixels: 50, totalPixels: 114, detected: true },
+          golPresentInFrame: true,
+        },
+      ],
+    });
+  }
+
+  for (let f = 18; f < 85; f++) {
+    const ts = f * 33;
+    let lx: number;
+    let rx: number;
+    if (f >= 36 && f <= 62) {
+      // Hands come together in contact
+      lx = 0.48;
+      rx = 0.52;
+    } else if (f > 62) {
+      const t = Math.min(1, (f - 62) / 14);
+      lx = 0.48 - 0.18 * t;
+      rx = 0.52 + 0.18 * t;
+    } else {
+      const t = (f - 18) / 18;
+      lx = 0.3 + 0.18 * t;
+      rx = 0.7 - 0.18 * t;
+    }
+
+    const leftHalfOpen = f >= 44 && f <= 48;
+    const rawDetections = [
+      {
+        landmarks: makeQuickPose({ x: lx, y: 0.68 }, leftHalfOpen ? 'half-open' : 'fist'),
+        handedness: 'LEFT' as const,
+        handednessScore: 0.92,
+      },
+      {
+        landmarks: makeQuickPose({ x: rx, y: 0.68 }, 'fist', true),
+        handedness: 'RIGHT' as const,
+        handednessScore: 0.92,
+      },
+    ];
+    const hands = tracker.update(rawDetections, ts);
+    const features = extractor.update({ hands, quality: baseQuality });
+    recorder.recordFrame({
+      timestampMs: ts,
+      rawDetections,
+      hands,
+      quality: baseQuality,
+      features,
+    });
+  }
+
+  {
+    const ts = 85 * 33;
+    const rawDetections = [
+      { landmarks: makeQuickPose({ x: 0.3, y: 0.7 }, 'open'), handedness: 'LEFT' as const, handednessScore: 0.94 },
+      { landmarks: makeQuickPose({ x: 0.7, y: 0.7 }, 'open', true), handedness: 'RIGHT' as const, handednessScore: 0.94 },
+    ];
+    const hands = tracker.update(rawDetections, ts);
+    const features = extractor.update({ hands, quality: baseQuality });
+    recorder.recordFrame({
+      timestampMs: ts,
+      rawDetections,
+      hands,
+      quality: baseQuality,
+      features,
+      reveal: {
+        bothOpen: true,
+        outcome: 'RIGHT',
+        leftGolDetected: false,
+        rightGolDetected: true,
       },
     });
   }

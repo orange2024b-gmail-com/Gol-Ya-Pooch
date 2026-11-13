@@ -449,6 +449,80 @@ input {
   display: inline-block;
 }
 
+.guess-prob-pill {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: rgba(16, 185, 129, 0.18);
+  border: 1px solid rgba(16, 185, 129, 0.55);
+  color: #a7f3d0;
+  font-weight: 700;
+  font-size: 0.95rem;
+}
+
+.explanation-box {
+  margin: 12px 0;
+  padding: 14px;
+  border-radius: var(--radius-md);
+  background: var(--bg-card);
+  border: 1px solid rgba(56, 189, 248, 0.35);
+}
+
+.explanation-box strong {
+  color: var(--accent-sky);
+  display: block;
+  margin-bottom: 4px;
+}
+
+.explanation-box p {
+  margin: 4px 0 8px;
+}
+
+.timeline-list {
+  margin: 8px 0 0;
+  padding-inline-start: 18px;
+  color: var(--text-muted);
+  font-size: 0.88rem;
+}
+
+.debug-belief-wrap {
+  margin: 10px 0 14px;
+  padding: 12px;
+  border-radius: var(--radius-md);
+  background: #0e191d;
+  border: 1px solid rgba(52, 211, 153, 0.35);
+}
+
+.debug-belief-header {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 0.82rem;
+  color: var(--accent-gold-strong);
+  margin-bottom: 8px;
+}
+
+.debug-belief-canvas {
+  width: 100%;
+  max-width: 100%;
+  height: 120px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  display: block;
+}
+
+.debug-timeline-list {
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+  font-family: monospace;
+  font-size: 0.78rem;
+  color: #cbd5e1;
+  width: 100%;
+}
+
 .hidden {
   display: none !important;
 }

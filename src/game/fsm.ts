@@ -1,4 +1,11 @@
 import type { HandSide, RevealOutcome } from '../vision/types';
+import {
+  CLASSIC_1V1_RULES,
+  loadRuleSet,
+  resolveRoundByRules,
+  type PlayerRole,
+  type RuleSetDefinition,
+} from './rules/engine';
 
 export const ALL_FSM_STATES = [
   'SPLASH',
@@ -35,25 +42,39 @@ export interface FsmConfig {
 }
 
 export const DEFAULT_FSM_CONFIG: FsmConfig = {
-  showDurationMs: 12_000,
-  hideDurationMs: 10_000,
-  guessDisplayMs: 2_500,
-  revealDurationMs: 10_000,
-  maxHandLostMs: 500,
-  targetScore: 7,
+  showDurationMs: CLASSIC_1V1_RULES.timeoutsMs.showGol,
+  hideDurationMs: CLASSIC_1V1_RULES.timeoutsMs.hiding,
+  guessDisplayMs: CLASSIC_1V1_RULES.timeoutsMs.guessDisplay,
+  revealDurationMs: CLASSIC_1V1_RULES.timeoutsMs.revealVerify,
+  maxHandLostMs: CLASSIC_1V1_RULES.voidConditions.maxHandLostMs,
+  targetScore: CLASSIC_1V1_RULES.targetScore,
 };
+
+export interface AiGuessPayload {
+  guess: HandSide;
+  probability: number;
+  explanationFa: string;
+  timelineEvents?: string[];
+}
 
 export interface GameContext {
   state: GameStateName;
   calibrated: boolean;
+  ruleSet: RuleSetDefinition;
+  ruleHiderOwner: PlayerRole;
+  ruleGuesserOwner: PlayerRole;
   roundNumber: number;
   validRoundsCompleted: number;
   humanScore: number;
   computerScore: number;
+  matchWinner: PlayerRole | null;
   phaseRemainingMs: number;
   pinchConfirmed: boolean;
   initialShownHand: HandSide | null;
   computerGuess: HandSide | null;
+  computerGuessProb: number | null;
+  explanationFa: string | null;
+  timelineEvents: string[];
   revealedHand: HandSide | null;
   lastRoundWinner: 'HUMAN' | 'COMPUTER' | null;
   voidReason: VoidReason | null;
@@ -69,15 +90,25 @@ export type GameEvent =
   | { type: 'CAMERA_READY' }
   | { type: 'CALIBRATION_COMPLETE' }
   | { type: 'OPEN_CALIBRATION' }
+  | { type: 'SET_TARGET_SCORE'; targetScore: number }
   | { type: 'START_GAME' }
   | { type: 'PINCH_CONFIRMED'; side: HandSide }
-  | { type: 'FINISH_HIDING' }
+  | {
+      type: 'FINISH_HIDING';
+      aiGuess?: AiGuessPayload;
+    }
   | { type: 'PROCEED_TO_REVEAL' }
   | { type: 'REVEAL_VERIFIED'; outcome: RevealOutcome }
   | { type: 'NEXT_ROUND' }
   | { type: 'RESET_MATCH' }
   | { type: 'EXIT_TO_MENU' }
-  | { type: 'TICK'; dtMs: number; maxLostDurationMs?: number; randomBit?: 0 | 1 }
+  | {
+      type: 'TICK';
+      dtMs: number;
+      maxLostDurationMs?: number;
+      randomBit?: 0 | 1;
+      aiGuess?: AiGuessPayload;
+    }
   | { type: 'TAB_HIDDEN' }
   | { type: 'TAB_VISIBLE' }
   | { type: 'CAMERA_LOST'; messageFa?: string }
@@ -93,18 +124,39 @@ export const VOID_MESSAGES_FA: Record<VoidReason, string> = {
   CAMERA_INTERRUPTED: 'ارتباط دوربین قطع و دوباره وصل شد؛ دور فعلی باطل و تکرار می‌شود.',
 };
 
-export function createInitialGameContext(config: Partial<FsmConfig> = {}): GameContext {
+export function createInitialGameContext(
+  config: Partial<FsmConfig> = {},
+  ruleSet: RuleSetDefinition = CLASSIC_1V1_RULES
+): GameContext {
+  const mergedConfig: FsmConfig = {
+    showDurationMs: ruleSet.timeoutsMs.showGol,
+    hideDurationMs: ruleSet.timeoutsMs.hiding,
+    guessDisplayMs: ruleSet.timeoutsMs.guessDisplay,
+    revealDurationMs: ruleSet.timeoutsMs.revealVerify,
+    maxHandLostMs: ruleSet.voidConditions.maxHandLostMs,
+    targetScore: ruleSet.targetScore,
+    ...config,
+  };
+  const effectiveRules = loadRuleSet(ruleSet, { targetScore: mergedConfig.targetScore });
+
   return {
     state: 'SPLASH',
     calibrated: false,
+    ruleSet: effectiveRules,
+    ruleHiderOwner: 'HUMAN',
+    ruleGuesserOwner: 'COMPUTER',
     roundNumber: 1,
     validRoundsCompleted: 0,
     humanScore: 0,
     computerScore: 0,
+    matchWinner: null,
     phaseRemainingMs: 0,
     pinchConfirmed: false,
     initialShownHand: null,
     computerGuess: null,
+    computerGuessProb: null,
+    explanationFa: null,
+    timelineEvents: [],
     revealedHand: null,
     lastRoundWinner: null,
     voidReason: null,
@@ -112,19 +164,32 @@ export function createInitialGameContext(config: Partial<FsmConfig> = {}): GameC
     pausedFrom: null,
     cameraErrorReturnState: null,
     cameraErrorMessageFa: null,
-    config: { ...DEFAULT_FSM_CONFIG, ...config },
+    config: mergedConfig,
   };
 }
 
-function makePlaceholderGuess(randomBit?: 0 | 1): HandSide {
-  if (randomBit === 0) return 'LEFT';
-  if (randomBit === 1) return 'RIGHT';
-  if (typeof globalThis.crypto !== 'undefined' && typeof globalThis.crypto.getRandomValues === 'function') {
+function makeFallbackGuess(randomBit?: 0 | 1): AiGuessPayload {
+  let guess: HandSide;
+  if (randomBit === 0) {
+    guess = 'LEFT';
+  } else if (randomBit === 1) {
+    guess = 'RIGHT';
+  } else if (
+    typeof globalThis.crypto !== 'undefined' &&
+    typeof globalThis.crypto.getRandomValues === 'function'
+  ) {
     const arr = new Uint8Array(1);
     globalThis.crypto.getRandomValues(arr);
-    return (arr[0]! & 1) === 0 ? 'LEFT' : 'RIGHT';
+    guess = (arr[0]! & 1) === 0 ? 'LEFT' : 'RIGHT';
+  } else {
+    guess = Math.random() < 0.5 ? 'LEFT' : 'RIGHT';
   }
-  return Math.random() < 0.5 ? 'LEFT' : 'RIGHT';
+  return {
+    guess,
+    probability: 0.5,
+    explanationFa: 'بر اساس اطلاعات موجود، نزدیک‌ترین گزینه انتخاب شد.',
+    timelineEvents: [],
+  };
 }
 
 function transitionToVoid(ctx: GameContext, reason: VoidReason): GameContext {
@@ -143,14 +208,20 @@ function startRound(ctx: GameContext, resetScores: boolean): GameContext {
   return {
     ...ctx,
     state: 'SHOW_GOL',
+    ruleHiderOwner: resetScores ? 'HUMAN' : ctx.ruleHiderOwner,
+    ruleGuesserOwner: resetScores ? 'COMPUTER' : ctx.ruleGuesserOwner,
     roundNumber: resetScores ? 1 : ctx.roundNumber,
     validRoundsCompleted: resetScores ? 0 : ctx.validRoundsCompleted,
     humanScore: resetScores ? 0 : ctx.humanScore,
     computerScore: resetScores ? 0 : ctx.computerScore,
+    matchWinner: resetScores ? null : ctx.matchWinner,
     phaseRemainingMs: ctx.config.showDurationMs,
     pinchConfirmed: false,
     initialShownHand: null,
     computerGuess: null,
+    computerGuessProb: null,
+    explanationFa: null,
+    timelineEvents: [],
     revealedHand: null,
     lastRoundWinner: null,
     voidReason: null,
@@ -159,6 +230,16 @@ function startRound(ctx: GameContext, resetScores: boolean): GameContext {
 }
 
 export function transitionGameFsm(ctx: GameContext, event: GameEvent): GameContext {
+  if (event.type === 'SET_TARGET_SCORE') {
+    const clamped = Math.max(1, Math.min(50, Math.round(event.targetScore)));
+    const updatedRules = loadRuleSet(ctx.ruleSet, { targetScore: clamped });
+    return {
+      ...ctx,
+      ruleSet: updatedRules,
+      config: { ...ctx.config, targetScore: clamped },
+    };
+  }
+
   // Global tab-hidden pause handling
   if (event.type === 'TAB_HIDDEN') {
     if (
@@ -281,10 +362,14 @@ export function transitionGameFsm(ctx: GameContext, event: GameEvent): GameConte
         return { ...ctx, state: 'MENU', phaseRemainingMs: 0 };
       }
       if (event.type === 'FINISH_HIDING') {
+        const payload = event.aiGuess ?? makeFallbackGuess();
         return {
           ...ctx,
           state: 'COMPUTER_GUESS',
-          computerGuess: makePlaceholderGuess(),
+          computerGuess: payload.guess,
+          computerGuessProb: payload.probability,
+          explanationFa: payload.explanationFa,
+          timelineEvents: payload.timelineEvents ?? [],
           phaseRemainingMs: ctx.config.guessDisplayMs,
         };
       }
@@ -295,10 +380,14 @@ export function transitionGameFsm(ctx: GameContext, event: GameEvent): GameConte
         }
         const remaining = Math.max(0, ctx.phaseRemainingMs - Math.max(0, event.dtMs));
         if (remaining <= 0) {
+          const payload = event.aiGuess ?? makeFallbackGuess(event.randomBit);
           return {
             ...ctx,
             state: 'COMPUTER_GUESS',
-            computerGuess: makePlaceholderGuess(event.randomBit),
+            computerGuess: payload.guess,
+            computerGuessProb: payload.probability,
+            explanationFa: payload.explanationFa,
+            timelineEvents: payload.timelineEvents ?? [],
             phaseRemainingMs: ctx.config.guessDisplayMs,
           };
         }
@@ -346,16 +435,37 @@ export function transitionGameFsm(ctx: GameContext, event: GameEvent): GameConte
         if (event.outcome === 'BOTH') {
           return transitionToVoid(ctx, 'REVEAL_BOTH');
         }
+
         const computerWon = event.outcome === ctx.computerGuess;
+        const resolution = resolveRoundByRules(ctx.ruleSet, {
+          hider: 'HUMAN',
+          guesser: 'COMPUTER',
+          guessOutcome: computerWon ? 'CORRECT_DIRECT' : 'WRONG',
+        });
+
+        const nextHumanScore = ctx.humanScore + resolution.humanDelta;
+        const nextComputerScore = ctx.computerScore + resolution.computerDelta;
+        let matchWinner = ctx.matchWinner;
+        if (matchWinner === null) {
+          if (nextHumanScore >= ctx.ruleSet.targetScore) {
+            matchWinner = 'HUMAN';
+          } else if (nextComputerScore >= ctx.ruleSet.targetScore) {
+            matchWinner = 'COMPUTER';
+          }
+        }
+
         return {
           ...ctx,
           state: 'ROUND_RESULT',
           phaseRemainingMs: 0,
           revealedHand: event.outcome,
           validRoundsCompleted: ctx.validRoundsCompleted + 1,
-          computerScore: ctx.computerScore + (computerWon ? 1 : 0),
-          humanScore: ctx.humanScore + (computerWon ? 0 : 1),
-          lastRoundWinner: computerWon ? 'COMPUTER' : 'HUMAN',
+          humanScore: nextHumanScore,
+          computerScore: nextComputerScore,
+          ruleHiderOwner: resolution.nextHider,
+          ruleGuesserOwner: resolution.nextGuesser,
+          matchWinner,
+          lastRoundWinner: resolution.winner,
         };
       }
       if (event.type === 'TICK') {
@@ -370,6 +480,9 @@ export function transitionGameFsm(ctx: GameContext, event: GameEvent): GameConte
 
     case 'ROUND_RESULT': {
       if (event.type === 'NEXT_ROUND') {
+        if (ctx.matchWinner !== null) {
+          return startRound(ctx, true);
+        }
         return startRound({ ...ctx, roundNumber: ctx.roundNumber + 1 }, false);
       }
       if (event.type === 'RESET_MATCH') {

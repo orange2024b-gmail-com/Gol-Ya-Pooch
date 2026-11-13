@@ -1,3 +1,4 @@
+import type { BeliefState } from '../tracking/beliefFilter';
 import type {
   Landmark,
   PinchConfirmationState,
@@ -27,6 +28,8 @@ export interface OverlayRenderState {
   pinchObs: PinchObservation[];
   pinchState: PinchConfirmationState | null;
   revealResult: RevealVerificationResult | null;
+  /** Strictly rendered ONLY when showDebug is true. */
+  debugBelief?: BeliefState | null;
   fps: number;
   inferenceMs: number;
 }
@@ -196,11 +199,13 @@ export function renderVisionOverlay(
     }
   }
 
-  // On-canvas debug telemetry strip
+  // On-canvas debug telemetry strip (belief is ONLY visible when showDebug === true)
   if (state.showDebug) {
     ctx.save();
-    ctx.fillStyle = 'rgba(8, 15, 20, 0.78)';
-    ctx.fillRect(10, 10, Math.min(width - 20, 310), 98);
+    const hasBelief = Boolean(state.debugBelief);
+    const boxH = hasBelief ? 124 : 98;
+    ctx.fillStyle = 'rgba(8, 15, 20, 0.82)';
+    ctx.fillRect(10, 10, Math.min(width - 20, 320), boxH);
     ctx.fillStyle = '#e2e8f0';
     ctx.font = '600 12px monospace';
     ctx.textAlign = 'left';
@@ -225,6 +230,91 @@ export function renderVisionOverlay(
       20,
       90
     );
+    if (state.debugBelief) {
+      const b = state.debugBelief;
+      ctx.fillStyle = '#fbbf24';
+      ctx.fillText(
+        `HMM P(L)=${(b.pLeft * 100).toFixed(0)}% P(R)=${(b.pRight * 100).toFixed(0)}% conf=${b.confidence.toFixed(2)}`,
+        20,
+        112
+      );
+    }
     ctx.restore();
   }
+}
+
+/**
+ * Renders the live Bayesian belief trace graph inside the Debug Overlay.
+ * Plots P(LEFT) (emerald) and P(RIGHT) (sky) over frames, shading contact periods.
+ */
+export function renderBeliefGraphCanvas(
+  canvas: HTMLCanvasElement,
+  trace: readonly BeliefState[]
+): void {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  // Background & horizontal grid lines (0%, 50%, 100%)
+  ctx.fillStyle = '#071013';
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.12)';
+  ctx.lineWidth = 1;
+  for (const frac of [0.25, 0.5, 0.75]) {
+    const y = h * frac;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = 'rgba(226, 232, 240, 0.65)';
+  ctx.font = '11px monospace';
+  ctx.textAlign = 'left';
+  ctx.fillText('100% L', 6, 13);
+  ctx.fillText('50%', 6, h * 0.5 - 3);
+  ctx.fillText('0% L', 6, h - 5);
+
+  if (trace.length < 2) {
+    ctx.fillStyle = 'rgba(182, 200, 201, 0.6)';
+    ctx.fillText('Waiting for hiding-phase frames...', 60, h * 0.5 + 4);
+    return;
+  }
+
+  const padL = 48;
+  const padR = 10;
+  const padT = 10;
+  const padB = 10;
+  const plotW = Math.max(10, w - padL - padR);
+  const plotH = Math.max(10, h - padT - padB);
+  const stepX = plotW / Math.max(1, trace.length - 1);
+
+  // Shade contact episodes
+  ctx.fillStyle = 'rgba(245, 185, 66, 0.16)';
+  for (let i = 0; i < trace.length; i++) {
+    if (trace[i]!.inContact) {
+      const x = padL + i * stepX;
+      ctx.fillRect(x, padT, Math.max(2, stepX + 0.5), plotH);
+    }
+  }
+
+  const drawSeries = (getter: (b: BeliefState) => number, color: string) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    for (let i = 0; i < trace.length; i++) {
+      const x = padL + i * stepX;
+      const y = padT + (1 - getter(trace[i]!)) * plotH;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  };
+
+  drawSeries((b) => b.pRight, '#38bdf8');
+  drawSeries((b) => b.pLeft, '#34d399');
 }

@@ -1,11 +1,18 @@
+import type { RoundBehaviorRecord } from '../ai/behavior/types';
+import { HedgeEnsemble } from '../ai/ensemble';
+import { makeFinalGuess } from '../ai/guesser';
 import { CameraManager, type CameraDeviceSummary } from '../camera/cameraManager';
 import {
   createInitialGameContext,
   transitionGameFsm,
+  type AiGuessPayload,
   type GameContext,
   type GameEvent,
 } from '../game/fsm';
-import { renderVisionOverlay } from '../render/canvasOverlay';
+import { renderBeliefGraphCanvas, renderVisionOverlay } from '../render/canvasOverlay';
+import { DEFAULT_PROFILE_ID, IndexedDbProfileStore } from '../storage/profileStore';
+import { BeliefFilter, type BeliefState } from '../tracking/beliefFilter';
+import { FeatureExtractor, type FrameFeatures } from '../vision/features';
 import {
   PinchConfirmationTracker,
   calibrateGolColorFromRgba,
@@ -21,7 +28,10 @@ import {
   parseRecordedSession,
   replayRecordedSession,
 } from '../vision/recorder';
-import { createBuiltInSampleSession } from '../vision/sampleSession';
+import {
+  createBuiltInSampleSession,
+  createPhase2TransferSampleSession,
+} from '../vision/sampleSession';
 import type {
   GolColorModel,
   PinchConfirmationState,
@@ -42,13 +52,19 @@ export class GolYaPoochApp {
   private readonly tracker = new MediaPipeHandTracker();
   private readonly stabilityTracker = new CalibrationStabilityTracker(1000, 0.7);
   private readonly pinchTracker = new PinchConfirmationTracker(15);
+  private readonly featureExtractor = new FeatureExtractor();
+  private readonly beliefFilter = new BeliefFilter();
+  private readonly ensemble = new HedgeEnsemble();
+  private readonly profileStore = new IndexedDbProfileStore();
   private readonly recorder = new SessionRecorder();
 
+  private behaviorHistory: RoundBehaviorRecord[] = [];
   private videoEl!: HTMLVideoElement;
   private overlayCanvas!: HTMLCanvasElement;
   private overlayCtx!: CanvasRenderingContext2D;
   private sampleCanvas!: HTMLCanvasElement;
   private sampleCtx!: CanvasRenderingContext2D;
+  private beliefGraphCanvas: HTMLCanvasElement | null = null;
 
   private stageContainer!: HTMLElement;
   private stageBannerEl!: HTMLElement;
@@ -69,6 +85,8 @@ export class GolYaPoochApp {
   private lightingShiftDetected = false;
   private lastHands: VisionFrameHands | null = null;
   private lastQuality: QualityReport | null = null;
+  private lastFeatures: FrameFeatures | null = null;
+  private lastBelief: BeliefState | null = null;
   private lastPinchObs: PinchObservation[] = [];
   private lastPinchState: PinchConfirmationState | null = null;
   private lastRevealResult: RevealVerificationResult | null = null;
@@ -92,6 +110,27 @@ export class GolYaPoochApp {
     this.buildShell();
     this.bindGlobalListeners();
     this.renderUi();
+    void this.loadBehaviorProfile();
+  }
+
+  private async loadBehaviorProfile(): Promise<void> {
+    const profile = await this.profileStore.loadProfile(DEFAULT_PROFILE_ID);
+    if (!profile) return;
+    this.ensemble.restore(profile.ensemble);
+    this.behaviorHistory = profile.history;
+    if (this.ctx.state === 'MENU' || this.showDebug) {
+      this.renderUi();
+    }
+  }
+
+  private async saveBehaviorProfile(): Promise<void> {
+    await this.profileStore.saveProfile({
+      profileId: DEFAULT_PROFILE_ID,
+      updatedAtMs: Date.now(),
+      roundsPlayed: this.behaviorHistory.length,
+      ensemble: this.ensemble.serialize(),
+      history: this.behaviorHistory,
+    });
   }
 
   private buildShell(): void {
@@ -100,7 +139,6 @@ export class GolYaPoochApp {
     const shell = document.createElement('div');
     shell.className = 'app-shell';
 
-    // Top bar
     const topbar = document.createElement('header');
     topbar.className = 'topbar';
 
@@ -137,7 +175,6 @@ export class GolYaPoochApp {
     actions.append(this.topbarStatusEl, debugBtn);
     topbar.append(brand, actions);
 
-    // Main grid (camera stage + active screen panel)
     const mainGrid = document.createElement('main');
     mainGrid.className = 'main-grid';
 
@@ -206,18 +243,66 @@ export class GolYaPoochApp {
   private toggleDebug(): void {
     this.showDebug = !this.showDebug;
     this.renderDebugPanel();
+    if (this.shouldShowCameraStage()) {
+      this.updateLiveOverlay();
+    }
+  }
+
+  private computeAiGuess(): AiGuessPayload {
+    const snapshot = this.beliefFilter.getSnapshot();
+    const obsQuality = this.beliefFilter.getObservationQuality();
+    const behaviorPred = this.ensemble.predict(this.behaviorHistory);
+    const result = makeFinalGuess({
+      belief: snapshot,
+      observationQuality: obsQuality,
+      behavior: behaviorPred,
+    });
+    return {
+      guess: result.guess,
+      probability: result.probability,
+      explanationFa: result.explanationFa,
+      timelineEvents: result.timelineDescriptionsFa,
+    };
   }
 
   private dispatch(event: GameEvent): void {
     const prevState = this.ctx.state;
+
+    // Record behavioral feedback when a valid round completes
+    if (
+      prevState === 'REVEAL_VERIFY' &&
+      event.type === 'REVEAL_VERIFIED' &&
+      (event.outcome === 'LEFT' || event.outcome === 'RIGHT') &&
+      this.ctx.computerGuess !== null
+    ) {
+      const priorHistory = [...this.behaviorHistory];
+      this.ensemble.update(priorHistory, event.outcome);
+      this.behaviorHistory.push({
+        roundIndex: this.ctx.roundNumber,
+        timestampMs: Date.now(),
+        chosenHand: event.outcome,
+        computerGuess: this.ctx.computerGuess,
+        humanWon: event.outcome !== this.ctx.computerGuess,
+      });
+      void this.saveBehaviorProfile();
+    }
+
     this.ctx = transitionGameFsm(this.ctx, event);
 
     if (prevState !== this.ctx.state) {
       if (this.ctx.state === 'SHOW_GOL') {
         this.pinchTracker.reset();
+        this.featureExtractor.reset();
         this.lastPinchState = null;
         this.lastPinchObs = [];
         this.lastRevealResult = null;
+        this.lastBelief = null;
+      } else if (this.ctx.state === 'HIDING') {
+        this.featureExtractor.reset();
+        this.lastBelief = this.beliefFilter.init(
+          this.ctx.initialShownHand ?? 'LEFT',
+          this.lastHands?.timestampMs ?? performance.now()
+        );
       } else if (this.ctx.state === 'REVEAL_VERIFY') {
         this.lastRevealResult = null;
       } else if (this.ctx.state === 'CALIBRATION') {
@@ -234,7 +319,7 @@ export class GolYaPoochApp {
       if (this.shouldShowCameraStage()) {
         this.updateLiveOverlay();
       }
-      if (this.showDebug && performance.now() - this.lastDebugRenderTs > 200) {
+      if (this.showDebug && performance.now() - this.lastDebugRenderTs > 140) {
         this.updateDebugMetricsInPlace();
       }
       return;
@@ -281,7 +366,6 @@ export class GolYaPoochApp {
       const instantFps = 1000 / dtMs;
       this.fps = this.fps === 0 ? instantFps : this.fps * 0.85 + instantFps * 0.15;
 
-      // Performance budget monitor (< 24 FPS warning + graceful resolution degrade)
       if (this.fps < 22 && this.camera.isStreaming && !this.lowFpsDegraded) {
         this.lowFpsCounter += 1;
         if (this.lowFpsCounter > 45) {
@@ -316,7 +400,6 @@ export class GolYaPoochApp {
       this.overlayCanvas.height = vh;
     }
 
-    // Draw into 320x240 sampling canvas for fast typed-array ImageData checks
     const sw = this.sampleCanvas.width;
     const sh = this.sampleCanvas.height;
     this.sampleCtx.drawImage(this.videoEl, 0, 0, sw, sh);
@@ -338,6 +421,20 @@ export class GolYaPoochApp {
         );
       }
 
+      let golSightings = { left: 0, right: 0 };
+      if (this.ctx.state === 'HIDING' && this.golColorModel) {
+        golSightings = {
+          left: scanHandRoisForGol(this.lastHands.left, frameImageData.data, sw, sh, this.golColorModel),
+          right: scanHandRoisForGol(this.lastHands.right, frameImageData.data, sw, sh, this.golColorModel),
+        };
+      }
+
+      this.lastFeatures = this.featureExtractor.update({
+        hands: this.lastHands,
+        quality: this.lastQuality,
+        golSightings,
+      });
+
       if (this.ctx.state === 'CALIBRATION') {
         const st = this.stabilityTracker.update(this.lastHands, now);
         this.stabilityProgress = st.progress;
@@ -357,10 +454,8 @@ export class GolYaPoochApp {
         if (this.lastPinchState.confirmed && this.lastPinchState.confirmedSide) {
           this.dispatch({ type: 'PINCH_CONFIRMED', side: this.lastPinchState.confirmedSide });
         }
-      } else if (this.ctx.state === 'HIDING' && this.golColorModel) {
-        // Scan both hands for brief gol sightings (recorded numerically for debug/Phase 2)
-        scanHandRoisForGol(this.lastHands.left, frameImageData.data, sw, sh, this.golColorModel);
-        scanHandRoisForGol(this.lastHands.right, frameImageData.data, sw, sh, this.golColorModel);
+      } else if (this.ctx.state === 'HIDING') {
+        this.lastBelief = this.beliefFilter.update(this.lastFeatures);
         this.lastPinchObs = [];
       } else if (this.ctx.state === 'REVEAL_VERIFY' && this.golColorModel) {
         const reveal = verifyRevealHands(
@@ -385,6 +480,7 @@ export class GolYaPoochApp {
           rawDetections,
           hands: this.lastHands,
           ...(this.lastQuality ? { quality: this.lastQuality } : {}),
+          ...(this.lastFeatures ? { features: this.lastFeatures } : {}),
           ...(this.lastPinchObs.length > 0 ? { pinch: this.lastPinchObs } : {}),
           ...(this.lastRevealResult
             ? {
@@ -408,18 +504,20 @@ export class GolYaPoochApp {
       this.ctx.state === 'COMPUTER_GUESS' ||
       this.ctx.state === 'REVEAL_VERIFY'
     ) {
+      const willTimeoutHide =
+        this.ctx.state === 'HIDING' && this.ctx.phaseRemainingMs - dtMs <= 0;
       this.dispatch({
         type: 'TICK',
         dtMs,
         maxLostDurationMs: this.lastHands?.maxLostDurationMs ?? 0,
+        ...(willTimeoutHide ? { aiGuess: this.computeAiGuess() } : {}),
       });
     } else {
-      // Refresh calibration status & debug view smoothly without spamming FSM
       this.updateLiveOverlay();
       if (this.ctx.state === 'CALIBRATION') {
         this.updateDynamicFieldsInPlace();
       }
-      if (this.showDebug && performance.now() - this.lastDebugRenderTs > 200) {
+      if (this.showDebug && performance.now() - this.lastDebugRenderTs > 140) {
         this.updateDebugMetricsInPlace();
       }
     }
@@ -464,6 +562,7 @@ export class GolYaPoochApp {
     this.showDebug = true;
     this.tracker.resetTracking();
     this.pinchTracker.reset();
+    this.featureExtractor.reset();
 
     if (session.golColorModel) {
       this.golColorModel = session.golColorModel;
@@ -472,9 +571,8 @@ export class GolYaPoochApp {
     const summary = replayRecordedSession(session, { requiredPinchFrames: 15 });
     this.replayStatusText = `بازپخش ${toPersianDigits(summary.totalFrames)} فریم آغاز شد…`;
 
-    // Drive the FSM cleanly into SHOW_GOL so replay exercises the live state machine
     this.ctx = {
-      ...createInitialGameContext(),
+      ...createInitialGameContext({ targetScore: this.ctx.config.targetScore }),
       state: 'SHOW_GOL',
       calibrated: true,
       phaseRemainingMs: 12_000,
@@ -492,6 +590,7 @@ export class GolYaPoochApp {
       }
 
       this.lastHands = frame.hands;
+      this.lastFeatures = frame.features;
       this.lastPinchState = frame.pinchState;
       this.lastPinchObs = (session.frames[idx]?.pinch ?? []).map((p) => ({
         side: p.side,
@@ -511,9 +610,12 @@ export class GolYaPoochApp {
 
       if (this.ctx.state === 'SHOW_GOL' && frame.pinchState.confirmed && frame.pinchState.confirmedSide) {
         this.dispatch({ type: 'PINCH_CONFIRMED', side: frame.pinchState.confirmedSide });
-      } else if (this.ctx.state === 'HIDING' && idx >= summary.frames.length - 2) {
-        this.dispatch({ type: 'FINISH_HIDING' });
-        this.dispatch({ type: 'PROCEED_TO_REVEAL' });
+      } else if (this.ctx.state === 'HIDING') {
+        this.lastBelief = this.beliefFilter.update(frame.features);
+        if (idx >= summary.frames.length - 2) {
+          this.dispatch({ type: 'FINISH_HIDING', aiGuess: this.computeAiGuess() });
+          this.dispatch({ type: 'PROCEED_TO_REVEAL' });
+        }
       }
 
       if (this.ctx.state === 'REVEAL_VERIFY' && frame.reveal) {
@@ -535,6 +637,9 @@ export class GolYaPoochApp {
         this.overlayCanvas.height = 480;
       }
       this.updateLiveOverlay();
+      if (this.showDebug) {
+        this.updateDebugMetricsInPlace();
+      }
       idx += 1;
     }, 35);
   }
@@ -553,11 +658,12 @@ export class GolYaPoochApp {
       pinchObs: this.lastPinchObs,
       pinchState: this.lastPinchState,
       revealResult: this.lastRevealResult,
+      debugBelief: this.showDebug ? this.lastBelief : null,
       fps: this.fps,
       inferenceMs: this.inferenceMs,
     });
 
-    // Update stage banner
+    // Player-facing stage banner: NEVER reveal belief during HIDING
     this.stageBannerEl.className = 'stage-banner';
     if (this.ctx.state === 'SHOW_GOL') {
       if (this.lastPinchState?.confirmed) {
@@ -659,9 +765,10 @@ export class GolYaPoochApp {
       this.ctx.state === 'SHOW_GOL' ||
       this.ctx.state === 'HIDING' ||
       this.ctx.state === 'COMPUTER_GUESS' ||
-      this.ctx.state === 'REVEAL_VERIFY'
-        ? `دور ${toPersianDigits(this.ctx.roundNumber)} | شما ${toPersianDigits(this.ctx.humanScore)} - ${toPersianDigits(this.ctx.computerScore)} رایانه`
-        : 'نسخه نمایشی فاز ۱';
+      this.ctx.state === 'REVEAL_VERIFY' ||
+      this.ctx.state === 'ROUND_RESULT'
+        ? `دور ${toPersianDigits(this.ctx.roundNumber)} | شما ${toPersianDigits(this.ctx.humanScore)} - ${toPersianDigits(this.ctx.computerScore)} رایانه (هدف: ${toPersianDigits(this.ctx.ruleSet.targetScore)})`
+        : `فاز ۲ — ${this.ctx.ruleSet.nameFa}`;
 
     this.renderPanel();
     this.renderDebugPanel();
@@ -695,6 +802,9 @@ export class GolYaPoochApp {
         startBtn.setAttribute('data-testid', 'splash-start-btn');
         startBtn.addEventListener('click', () => this.dispatch({ type: 'GO_PERMISSION' }));
 
+        const replayRow = document.createElement('div');
+        replayRow.className = 'btn-row';
+
         const replayBtn = document.createElement('button');
         replayBtn.type = 'button';
         replayBtn.className = 'btn btn-secondary';
@@ -704,7 +814,17 @@ export class GolYaPoochApp {
           this.startSessionReplay(createBuiltInSampleSession())
         );
 
-        card.append(badge, h2, p, startBtn, replayBtn);
+        const transferReplayBtn = document.createElement('button');
+        transferReplayBtn.type = 'button';
+        transferReplayBtn.className = 'btn btn-secondary';
+        transferReplayBtn.textContent = FA.debugReplayTransfer;
+        transferReplayBtn.setAttribute('data-testid', 'replay-transfer-btn');
+        transferReplayBtn.addEventListener('click', () =>
+          this.startSessionReplay(createPhase2TransferSampleSession())
+        );
+
+        replayRow.append(replayBtn, transferReplayBtn);
+        card.append(badge, h2, p, startBtn, replayRow);
         break;
       }
 
@@ -866,6 +986,10 @@ export class GolYaPoochApp {
         const note = document.createElement('p');
         note.textContent = FA.menuPhaseNote;
 
+        const ruleSummary = document.createElement('div');
+        ruleSummary.className = 'check-item ok';
+        ruleSummary.textContent = `${this.ctx.ruleSet.nameFa}: ${this.ctx.ruleSet.descriptionFa}`;
+
         const btnRow = document.createElement('div');
         btnRow.className = 'btn-row';
 
@@ -883,6 +1007,25 @@ export class GolYaPoochApp {
         calBtn.addEventListener('click', () => this.dispatch({ type: 'OPEN_CALIBRATION' }));
 
         btnRow.append(playBtn, calBtn);
+
+        const targetWrap = document.createElement('div');
+        targetWrap.style.marginTop = '14px';
+        const targetLbl = document.createElement('label');
+        targetLbl.textContent = FA.targetScoreLabel;
+        const targetSelect = document.createElement('select');
+        targetSelect.className = 'field-select';
+        targetSelect.setAttribute('data-testid', 'target-score-select');
+        for (const scoreOpt of [3, 5, 7, 10]) {
+          const opt = document.createElement('option');
+          opt.value = String(scoreOpt);
+          opt.textContent = `${toPersianDigits(scoreOpt)} امتیاز`;
+          opt.selected = this.ctx.ruleSet.targetScore === scoreOpt;
+          targetSelect.append(opt);
+        }
+        targetSelect.addEventListener('change', () => {
+          this.dispatch({ type: 'SET_TARGET_SCORE', targetScore: Number(targetSelect.value) });
+        });
+        targetWrap.append(targetLbl, targetSelect);
 
         const settingsHeading = document.createElement('h3');
         settingsHeading.style.marginTop = '18px';
@@ -908,7 +1051,33 @@ export class GolYaPoochApp {
           })
         );
 
-        card.append(h2, note, btnRow, settingsHeading, settingsBox);
+        const memRow = document.createElement('div');
+        memRow.className = 'btn-row';
+        const memStat = document.createElement('span');
+        memStat.className = 'check-hint';
+        memStat.textContent = `تعداد دورهای ثبت‌شده در پروفایل محلی: ${toPersianDigits(this.behaviorHistory.length)}`;
+        const clearMemBtn = document.createElement('button');
+        clearMemBtn.type = 'button';
+        clearMemBtn.className = 'btn btn-secondary btn-compact';
+        clearMemBtn.textContent = FA.resetProfileMemoryBtn;
+        clearMemBtn.addEventListener('click', () => {
+          this.behaviorHistory = [];
+          this.ensemble.restore({ weights: {}, cumulativeLosses: {}, roundsUpdated: 0 });
+          void this.profileStore.clearProfile(DEFAULT_PROFILE_ID);
+          this.renderUi();
+        });
+        memRow.append(memStat, clearMemBtn);
+
+        card.append(
+          h2,
+          note,
+          ruleSummary,
+          btnRow,
+          targetWrap,
+          settingsHeading,
+          settingsBox,
+          memRow
+        );
         break;
       }
 
@@ -929,6 +1098,7 @@ export class GolYaPoochApp {
           p.textContent = `تثبیت پینچ: ${toPersianDigits(framesDone)} از ${toPersianDigits(framesReq)} فریم پیاپی`;
           card.append(h2, p);
         } else if (this.ctx.state === 'HIDING') {
+          // IMPORTANT: Never show tracking belief to player during HIDING!
           const h2 = document.createElement('h2');
           h2.textContent = FA.hidingIndicator;
           const p = document.createElement('p');
@@ -937,7 +1107,10 @@ export class GolYaPoochApp {
           doneBtn.type = 'button';
           doneBtn.className = 'btn btn-primary';
           doneBtn.textContent = FA.finishHidingBtn;
-          doneBtn.addEventListener('click', () => this.dispatch({ type: 'FINISH_HIDING' }));
+          doneBtn.setAttribute('data-testid', 'finish-hiding-btn');
+          doneBtn.addEventListener('click', () =>
+            this.dispatch({ type: 'FINISH_HIDING', aiGuess: this.computeAiGuess() })
+          );
           card.append(h2, p, doneBtn);
         } else if (this.ctx.state === 'COMPUTER_GUESS') {
           const h2 = document.createElement('h2');
@@ -949,16 +1122,22 @@ export class GolYaPoochApp {
           lbl.textContent = 'حدس رایانه:';
           const handEl = document.createElement('div');
           handEl.className = 'guess-hand-big';
+          handEl.setAttribute('data-testid', 'computer-guess-hand');
           handEl.textContent = this.ctx.computerGuess ? sideLabelFa(this.ctx.computerGuess) : '-';
-          const note = document.createElement('div');
-          note.className = 'check-hint';
-          note.textContent = FA.guessPlaceholderNote;
-          guessBox.append(lbl, handEl, note);
+
+          const probPct = Math.round((this.ctx.computerGuessProb ?? 0.5) * 100);
+          const probEl = document.createElement('div');
+          probEl.className = 'guess-prob-pill';
+          probEl.setAttribute('data-testid', 'guess-probability');
+          probEl.textContent = `اطمینان حدس: ${toPersianDigits(probPct)}٪`;
+
+          guessBox.append(lbl, handEl, probEl);
 
           const nextBtn = document.createElement('button');
           nextBtn.type = 'button';
           nextBtn.className = 'btn btn-primary';
           nextBtn.textContent = FA.proceedToRevealBtn;
+          nextBtn.setAttribute('data-testid', 'proceed-reveal-btn');
           nextBtn.addEventListener('click', () => this.dispatch({ type: 'PROCEED_TO_REVEAL' }));
 
           card.append(h2, guessBox, nextBtn);
@@ -993,21 +1172,62 @@ export class GolYaPoochApp {
             ? FA.roundResultComputerWon
             : FA.roundResultHumanWon;
 
+        if (this.ctx.matchWinner !== null) {
+          const winBanner = document.createElement('div');
+          winBanner.className = 'hero-badge';
+          winBanner.setAttribute('data-testid', 'match-winner-banner');
+          winBanner.textContent =
+            this.ctx.matchWinner === 'HUMAN' ? FA.matchWinnerHuman : FA.matchWinnerComputer;
+          card.append(winBanner);
+        }
+
+        const targetProgress = document.createElement('p');
+        targetProgress.className = 'check-hint';
+        targetProgress.setAttribute('data-testid', 'match-target-progress');
+        targetProgress.textContent = `امتیاز مسابقه (هدف ${toPersianDigits(this.ctx.ruleSet.targetScore)}): شما ${toPersianDigits(this.ctx.humanScore)} — رایانه ${toPersianDigits(this.ctx.computerScore)}`;
+
+        const probPct = Math.round((this.ctx.computerGuessProb ?? 0.5) * 100);
         const detail = document.createElement('p');
-        detail.textContent = `گل در ${this.ctx.revealedHand ? sideLabelFa(this.ctx.revealedHand) : '-'} بود | حدس رایانه: ${this.ctx.computerGuess ? sideLabelFa(this.ctx.computerGuess) : '-'}`;
+        detail.textContent = `گل در ${this.ctx.revealedHand ? sideLabelFa(this.ctx.revealedHand) : '-'} بود | حدس رایانه: ${this.ctx.computerGuess ? sideLabelFa(this.ctx.computerGuess) : '-'} (${toPersianDigits(probPct)}٪)`;
+
+        const explainBox = document.createElement('div');
+        explainBox.className = 'explanation-box';
+        explainBox.setAttribute('data-testid', 'round-explanation');
+        const explainTitle = document.createElement('strong');
+        explainTitle.textContent = 'تحلیل رایانه:';
+        const explainBody = document.createElement('p');
+        explainBody.textContent =
+          this.ctx.explanationFa ?? 'بر اساس نشانه‌های حرکتی تصمیم‌گیری شد.';
+        explainBox.append(explainTitle, explainBody);
+
+        if (this.ctx.timelineEvents.length > 0) {
+          const tlList = document.createElement('ul');
+          tlList.className = 'timeline-list';
+          tlList.setAttribute('data-testid', 'round-timeline');
+          for (const item of this.ctx.timelineEvents) {
+            const li = document.createElement('li');
+            li.textContent = item;
+            tlList.append(li);
+          }
+          explainBox.append(tlList);
+        }
 
         const btnRow = document.createElement('div');
         btnRow.className = 'btn-row';
 
-        const nextBtn = document.createElement('button');
-        nextBtn.type = 'button';
-        nextBtn.className = 'btn btn-primary';
-        nextBtn.textContent = FA.nextRoundBtn;
-        nextBtn.addEventListener('click', () => this.dispatch({ type: 'NEXT_ROUND' }));
+        if (this.ctx.matchWinner === null) {
+          const nextBtn = document.createElement('button');
+          nextBtn.type = 'button';
+          nextBtn.className = 'btn btn-primary';
+          nextBtn.textContent = FA.nextRoundBtn;
+          nextBtn.addEventListener('click', () => this.dispatch({ type: 'NEXT_ROUND' }));
+          btnRow.append(nextBtn);
+        }
 
         const resetBtn = document.createElement('button');
         resetBtn.type = 'button';
-        resetBtn.className = 'btn btn-secondary';
+        resetBtn.className =
+          this.ctx.matchWinner !== null ? 'btn btn-primary' : 'btn btn-secondary';
         resetBtn.textContent = FA.resetMatchBtn;
         resetBtn.addEventListener('click', () => this.dispatch({ type: 'RESET_MATCH' }));
 
@@ -1017,8 +1237,8 @@ export class GolYaPoochApp {
         exitBtn.textContent = FA.exitToMenuBtn;
         exitBtn.addEventListener('click', () => this.dispatch({ type: 'EXIT_TO_MENU' }));
 
-        btnRow.append(nextBtn, resetBtn, exitBtn);
-        card.append(h2, detail, btnRow);
+        btnRow.append(resetBtn, exitBtn);
+        card.append(h2, targetProgress, detail, explainBox, btnRow);
         break;
       }
 
@@ -1119,9 +1339,15 @@ export class GolYaPoochApp {
     };
 
     row.append(
-      makeStat('امتیاز شما', toPersianDigits(this.ctx.humanScore)),
+      makeStat(
+        `امتیاز شما (از ${toPersianDigits(this.ctx.ruleSet.targetScore)})`,
+        toPersianDigits(this.ctx.humanScore)
+      ),
       makeStat('زمان مرحله', formatSecondsFa(this.ctx.phaseRemainingMs), true),
-      makeStat('امتیاز رایانه', toPersianDigits(this.ctx.computerScore))
+      makeStat(
+        `امتیاز رایانه (از ${toPersianDigits(this.ctx.ruleSet.targetScore)})`,
+        toPersianDigits(this.ctx.computerScore)
+      )
     );
     return row;
   }
@@ -1144,26 +1370,36 @@ export class GolYaPoochApp {
   }
 
   private getDebugMetricValues(): Array<[string, string]> {
+    const belief = this.lastBelief ?? this.beliefFilter.getBelief();
+    const behav = this.ensemble.predict(this.behaviorHistory);
     return [
       ['FSM State', this.ctx.state],
       ['FPS / Infer', `${this.fps.toFixed(1)} fps / ${this.inferenceMs.toFixed(1)} ms`],
       [
         'Left Hand',
         this.lastHands?.left.detected
-          ? `OK (lost:${this.lastHands.left.lostFrames}, conf:${this.lastHands.left.confidence.toFixed(2)})`
+          ? `OK (curl:${this.lastFeatures?.left.totalCurl.toFixed(2) ?? '-'}, comp:${this.lastFeatures?.left.fistCompactness.toFixed(2) ?? '-'})`
           : `LOST (${this.lastHands?.left.lostFrames ?? 0}, occ:${Boolean(this.lastHands?.left.occluded)})`,
       ],
       [
         'Right Hand',
         this.lastHands?.right.detected
-          ? `OK (lost:${this.lastHands.right.lostFrames}, conf:${this.lastHands.right.confidence.toFixed(2)})`
+          ? `OK (curl:${this.lastFeatures?.right.totalCurl.toFixed(2) ?? '-'}, comp:${this.lastFeatures?.right.fistCompactness.toFixed(2) ?? '-'})`
           : `LOST (${this.lastHands?.right.lostFrames ?? 0}, occ:${Boolean(this.lastHands?.right.occluded)})`,
       ],
       [
-        'Lighting / Blur',
-        this.lastQuality
-          ? `L=${this.lastQuality.meanLuminance.toFixed(0)} S=${this.lastQuality.contrastStd.toFixed(0)} B=${this.lastQuality.blurScore.toFixed(0)}`
+        'Inter-Hand',
+        this.lastFeatures
+          ? `${this.lastFeatures.interHand.inContact ? 'CONTACT' : 'APART'} (d=${this.lastFeatures.interHand.minLandmarkDistanceNorm.toFixed(2)}, dur=${Math.round(this.lastFeatures.interHand.contactDurationMs)}ms)`
           : 'N/A',
+      ],
+      [
+        'HMM Belief',
+        `P(L)=${(belief.pLeft * 100).toFixed(0)}% | P(R)=${(belief.pRight * 100).toFixed(0)}% | conf=${belief.confidence.toFixed(2)}`,
+      ],
+      [
+        'Behavior Prior',
+        `P(L)=${(behav.pLeft * 100).toFixed(0)}% (${this.behaviorHistory.length} rounds)`,
       ],
       [
         'Recorder',
@@ -1181,6 +1417,41 @@ export class GolYaPoochApp {
       );
       if (el) {
         el.textContent = value;
+      }
+    }
+
+    if (this.beliefGraphCanvas) {
+      renderBeliefGraphCanvas(this.beliefGraphCanvas, this.beliefFilter.getSnapshot().trace);
+    }
+
+    const tlList = this.debugContainer.querySelector<HTMLElement>(
+      '[data-testid="debug-timeline-list"]'
+    );
+    if (tlList) {
+      const snap = this.beliefFilter.getSnapshot();
+      tlList.innerHTML = '';
+      if (snap.timeline.length === 0) {
+        const li = document.createElement('li');
+        li.textContent = 'No tracking events recorded yet in current round.';
+        tlList.append(li);
+      } else {
+        for (const ev of snap.timeline.slice(-6)) {
+          const li = document.createElement('li');
+          if (ev.type === 'CONTACT_START') {
+            li.textContent = `[${ev.relativeSec.toFixed(2)}s] CONTACT_START (d=${ev.minDistanceNorm.toFixed(2)})`;
+          } else if (ev.type === 'CONTACT_END') {
+            li.textContent = `[${ev.relativeSec.toFixed(2)}s] CONTACT_END (${ev.durationMs.toFixed(0)}ms)`;
+          } else if (ev.type === 'PARTIAL_OPENING') {
+            li.textContent = `[${ev.relativeSec.toFixed(2)}s] PARTIAL_OPENING ${ev.side} (str=${ev.strength.toFixed(2)}, contact=${ev.duringContact})`;
+          } else if (ev.type === 'GOL_SIGHTING') {
+            li.textContent = `[${ev.relativeSec.toFixed(2)}s] GOL_SIGHTING ${ev.side} (score=${ev.score.toFixed(2)})`;
+          } else if (ev.type === 'OCCLUSION_START') {
+            li.textContent = `[${ev.relativeSec.toFixed(2)}s] OCCLUSION_START (${ev.side})`;
+          } else {
+            li.textContent = `[${ev.relativeSec.toFixed(2)}s] OCCLUSION_END (${ev.durationMs.toFixed(0)}ms)`;
+          }
+          tlList.append(li);
+        }
       }
     }
   }
@@ -1210,6 +1481,29 @@ export class GolYaPoochApp {
       box.append(s, v);
       grid.append(box);
     }
+
+    const beliefSection = document.createElement('div');
+    beliefSection.className = 'debug-belief-wrap';
+    beliefSection.setAttribute('data-testid', 'debug-belief-panel');
+
+    const chartHeader = document.createElement('div');
+    chartHeader.className = 'debug-belief-header';
+    chartHeader.innerHTML =
+      '<strong>Live HMM Belief Trace</strong><span class="ltr-inline">Emerald: P(LEFT) | Sky: P(RIGHT) | Amber: Contact</span>';
+
+    const chartCanvas = document.createElement('canvas');
+    chartCanvas.className = 'debug-belief-canvas';
+    chartCanvas.width = 560;
+    chartCanvas.height = 120;
+    chartCanvas.setAttribute('data-testid', 'debug-belief-chart');
+    this.beliefGraphCanvas = chartCanvas;
+    renderBeliefGraphCanvas(chartCanvas, this.beliefFilter.getSnapshot().trace);
+
+    const tlList = document.createElement('ul');
+    tlList.className = 'debug-timeline-list ltr-inline';
+    tlList.setAttribute('data-testid', 'debug-timeline-list');
+
+    beliefSection.append(chartHeader, chartCanvas, tlList);
 
     const btnRow = document.createElement('div');
     btnRow.className = 'btn-row';
@@ -1246,6 +1540,15 @@ export class GolYaPoochApp {
       this.startSessionReplay(createBuiltInSampleSession())
     );
 
+    const transferBtn = document.createElement('button');
+    transferBtn.type = 'button';
+    transferBtn.className = 'btn btn-secondary btn-compact';
+    transferBtn.textContent = FA.debugReplayTransfer;
+    transferBtn.setAttribute('data-testid', 'debug-replay-transfer-btn');
+    transferBtn.addEventListener('click', () =>
+      this.startSessionReplay(createPhase2TransferSampleSession())
+    );
+
     const fileInput = document.createElement('input');
     fileInput.type = 'file';
     fileInput.accept = 'application/json,.json';
@@ -1265,8 +1568,9 @@ export class GolYaPoochApp {
     loadBtn.textContent = FA.debugLoadJson;
     loadBtn.addEventListener('click', () => fileInput.click());
 
-    btnRow.append(recBtn, sampleBtn, loadBtn, fileInput);
-    this.debugContainer.append(title, grid, btnRow);
+    btnRow.append(recBtn, sampleBtn, transferBtn, loadBtn, fileInput);
+    this.debugContainer.append(title, grid, beliefSection, btnRow);
+    this.updateDebugMetricsInPlace();
 
     if (this.replayStatusText) {
       const statusP = document.createElement('p');

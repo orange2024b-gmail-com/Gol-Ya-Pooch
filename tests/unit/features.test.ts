@@ -145,7 +145,7 @@ describe('Per-frame feature extraction (src/vision/features.ts)', () => {
     });
 
     // Establish closed baseline for 6 frames apart with alternating micro-jitter
-    let lastFeat = null;
+    let lastFeat: ReturnType<FeatureExtractor['update']> | null = null;
     for (let i = 0; i < 6; i++) {
       const vx = i % 2 === 0 ? 0.08 : -0.08;
       lastFeat = extractor.update({
@@ -156,6 +156,7 @@ describe('Per-frame feature extraction (src/vision/features.ts)', () => {
         golSightings: { left: 0.02, right: 0 },
       });
     }
+    expect(lastFeat).not.toBeNull();
     expect(lastFeat!.interHand.inContact).toBe(false);
     expect(lastFeat!.interHand.contactDurationMs).toBe(0);
     expect(lastFeat!.left.jitter).toBeGreaterThan(0);
