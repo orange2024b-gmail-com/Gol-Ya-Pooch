@@ -3,5 +3,9 @@ dist/
 coverage/
 playwright-report/
 test-results/
+training/.venv/
+training/**/__pycache__/
+training/.pytest_cache/
+*.pyc
 .DS_Store
 *.log
