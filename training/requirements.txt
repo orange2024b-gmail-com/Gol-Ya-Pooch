@@ -1,0 +1,7 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+numpy==2.5.4
+torch==2.15.0+cpu
+onnx==1.23.2
+onnxscript==0.7.2
+onnxruntime==1.32.0
+pytest==9.2.0

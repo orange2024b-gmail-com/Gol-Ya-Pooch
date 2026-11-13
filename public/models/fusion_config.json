@@ -1,0 +1,48 @@
+{
+  "modelVersion": "phase4-cnn-v1",
+  "shipGatePassed": true,
+  "seqLen": 64,
+  "featureDim": 24,
+  "sampleRateHz": 10,
+  "featureNames": [
+    "initialSideSign",
+    "leftDetected",
+    "rightDetected",
+    "leftCurl",
+    "rightCurl",
+    "leftCompactness",
+    "rightCompactness",
+    "leftCompactnessDelta",
+    "rightCompactnessDelta",
+    "leftFingertipDistNorm",
+    "rightFingertipDistNorm",
+    "leftWristSpeed",
+    "rightWristSpeed",
+    "leftJitter",
+    "rightJitter",
+    "leftPartialOpen",
+    "rightPartialOpen",
+    "leftGolSighting",
+    "rightGolSighting",
+    "inContact",
+    "interHandDistNorm",
+    "contactDurationNorm",
+    "lowQuality",
+    "progressNorm"
+  ],
+  "fusionWeights": {
+    "hmmWeight": 0.05,
+    "temporalWeight": 0.729014,
+    "bias": -0.060954
+  },
+  "heldOutEvaluation": {
+    "testRounds": 162,
+    "hmmAccuracy": 0.759259,
+    "hmmEce": 0.202174,
+    "temporalAccuracy": 0.895062,
+    "temporalEce": 0.076998,
+    "fusedAccuracy": 0.901235,
+    "fusedEce": 0.059886,
+    "parityMaxAbsDiff": 6.079673767089844e-06
+  }
+}
