@@ -1,0 +1,36 @@
+{
+  "name": "gol-ya-pooch",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Gol ya Pooch (گل یا پوچ) — client-side computer vision web game",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "playwright test",
+    "assets:sync": "node scripts/sync-assets.mjs"
+  },
+  "dependencies": {
+    "@mediapipe/tasks-vision": "1.2.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@fontsource/vazirmatn": "5.3.0",
+    "@playwright/test": "1.65.0",
+    "@types/node": "22.20.5",
+    "@vitest/coverage-v8": "5.1.0",
+    "eslint": "10.14.0",
+    "fast-check": "4.10.2",
+    "globals": "17.14.0",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.72.2",
+    "vite": "8.3.8",
+    "vitest": "5.1.0"
+  }
+}
