@@ -13,10 +13,18 @@ export function sideLabelFa(side: 'LEFT' | 'RIGHT'): string {
   return side === 'LEFT' ? 'دست چپ' : 'دست راست';
 }
 
+export function handIndexLabelFa(handIndex: number, handsCount: number): string {
+  if (handsCount === 2) {
+    return handIndex === 0 ? 'دست چپ' : 'دست راست';
+  }
+  return `دست ${toPersianDigits(handIndex + 1)}`;
+}
+
 export const FA = {
   appTitle: 'گل یا پوچ',
-  appSubtitle: 'بازی سنتی ایرانی در برابر هوش مصنوعی با بینایی ماشین (فاز ۲)',
+  appSubtitle: 'بازی سنتی ایرانی در برابر هوش مصنوعی با بینایی ماشین (فاز ۳)',
   splashStartBtn: 'شروع و راه‌اندازی دوربین',
+  splashPracticeBtn: 'بازی تمرینی با پنهان‌کاری رایانه (بدون دوربین)',
   splashPrivacyBadge: '۱۰۰٪ پردازش روی دستگاه شما — هیچ تصویر یا ویدیویی ارسال نمی‌شود',
   permissionTitle: 'دسترسی به دوربین و تضمین حریم خصوصی',
   permissionBody:
@@ -31,8 +39,7 @@ export const FA = {
     'دسترسی دوربین رد شد یا دوربینی یافت نشد. در تنظیمات مرورگر دسترسی دوربین را فعال کنید و دوباره تلاش کنید.',
   cameraSelectLabel: 'انتخاب دوربین',
   calibrationTitle: 'جادوگر کالیبراسیون دوربین و گل',
-  calibrationIntro:
-    'برای شروع بازی، هر چهار بررسی زیر باید با موفقیت انجام شود:',
+  calibrationIntro: 'برای شروع بازی، هر چهار بررسی زیر باید با موفقیت انجام شود:',
   calCheckLighting: '۱. روشنایی و کنتراست محیط',
   calCheckHands: '۲. تشخیص هر دو دست (حداقل ۱ ثانیه با اطمینان > ۷۰٪)',
   calCheckDistance: '۳. فاصله دست‌ها از دوربین',
@@ -45,14 +52,17 @@ export const FA = {
   calCompleteBtn: 'تأیید و ورود به منوی بازی',
   calMirrorToggle: 'نمایش آینه‌ای دوربین',
   calLandmarkToggle: 'نمایش نقاط کلیدی دست',
-  menuTitle: 'منوی اصلی — قوانین کلاسیک دو نفره',
-  menuPlayBtn: 'شروع مسابقه (قوانین کلاسیک ۱ به ۱)',
+  menuTitle: 'منوی اصلی بازی',
+  menuPlayBtn: 'شروع مسابقه (سطح انتخاب‌شده)',
+  menuLevelsBtn: 'انتخاب سطح (۱ تا ۵)',
+  menuStatsBtn: 'آمار و پیشرفت',
+  menuRulesBtn: 'قوانین و حالت تیمی',
   menuRecalibrateBtn: 'کالیبراسیون مجدد',
   menuSettingsHeading: 'تنظیمات و دسترسی‌پذیری',
   menuPhaseNote:
-    'فاز ۲ فعال است: ردیابی بیزین، تحلیل حرکت دست‌ها، مدل عادت‌های رفتاری (ذخیره محلی فقط‌عددی) و قوانین کلاسیک دو نفره.',
+    'فاز ۳ فعال است: نوبت‌های پنهان‌کاری رایانه با PixiJS، تعهد رمزنگاری SHA-256، قوانین تیمی پوچ و گل و ۵ سطح پیشرفت.',
   targetScoreLabel: 'امتیاز هدف برای برد مسابقه',
-  resetProfileMemoryBtn: 'پاک‌سازی حافظه رفتاری ذخیره شده',
+  resetProfileMemoryBtn: 'پاک‌سازی حافظه رفتاری و آمار',
   reducedMotionLabel: 'کاهش انیمیشن‌ها (Reduced Motion)',
   debugToggleLabel: 'نمایش پنل دیباگ (کلید D)',
   showGolPrompt: 'گل را بین شست و اشاره نشان بده',
@@ -64,11 +74,12 @@ export const FA = {
   proceedToRevealBtn: 'رفتن به مرحله باز کردن دست‌ها',
   revealPrompt: 'هر دو دست را باز کنید و کف دست‌ها را رو به دوربین بگیرید',
   revealWaitingHands: 'در انتظار باز شدن کامل هر دو دست…',
-  roundResultComputerWon: 'رایانه درست حدس زد! (+۱ امتیاز رایانه)',
-  roundResultHumanWon: 'شما رایانه را فریب دادید! (+۱ امتیاز شما)',
+  roundResultComputerWon: 'رایانه این دور را برد!',
+  roundResultHumanWon: 'شما این دور را بردید!',
   matchWinnerHuman: '🏆 تبریک! شما برنده مسابقه شدید!',
   matchWinnerComputer: '🤖 رایانه برنده این مسابقه شد!',
   nextRoundBtn: 'دور بعدی',
+  nextSeriesMatchBtn: 'مسابقه بعدی در سری ۳ تایی',
   replayVoidBtn: 'تکرار دور',
   resetMatchBtn: 'شروع مسابقه جدید',
   exitToMenuBtn: 'بازگشت به منو',
@@ -84,4 +95,18 @@ export const FA = {
   debugReplayTransfer: 'بازپخش نمونه انتقال (فاز ۲)',
   debugLoadJson: 'بارگذاری فایل JSON برای بازپخش',
   lowFpsWarning: 'سرعت پردازش پایین است؛ رزولوشن برای روانی بازی کاهش یافت.',
+  computerHidesTitle: 'نوبت پنهان‌کاری رایانه',
+  computerHidesDesc: 'رایانه با انیمیشن و حرکات فریبنده گل را پنهان می‌کند…',
+  computerHidesReducedDesc: 'حالت کاهش انیمیشن فعال است؛ دست‌ها بدون حرکت سریع آماده حدس می‌شوند.',
+  humanGuessTitle: 'نوبت حدس شما',
+  humanGuessPromptClassic: 'روی دستی که فکر می‌کنید گل در آن است ضربه بزنید.',
+  humanGuessPromptTeam: 'حالت تیمی: روی دست‌های مشکوک به خالی «پوچ» بزنید یا با «گل» جای اصلی را اعلام کنید.',
+  poochActionBtn: 'پوچ',
+  golActionBtn: 'گل',
+  commitLabel: 'اثر انگشت تعهد رمزنگاری (پیش از حدس):',
+  commitVerifying: 'در حال بررسی امضای SHA-256…',
+  howItWorksBtn: 'این چطور کار می‌کند؟',
+  levelSelectTitle: 'انتخاب سطح (۱ تا ۵)',
+  statsTitle: 'آمار و پیشرفت بازیکن',
+  rulesTitle: 'قوانین بازی و تنظیمات حالت تیمی',
 } as const;

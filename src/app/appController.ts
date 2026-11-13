@@ -1,16 +1,44 @@
 import type { RoundBehaviorRecord } from '../ai/behavior/types';
 import { HedgeEnsemble } from '../ai/ensemble';
 import { makeFinalGuess } from '../ai/guesser';
+import {
+  chooseComputerHidingHand,
+  generateHidingChoreography,
+} from '../ai/hider';
 import { CameraManager, type CameraDeviceSummary } from '../camera/cameraManager';
+import {
+  COMMIT_REVEAL_EXPLANATION_FA,
+  createCommitEnvelope,
+  verifyCommitReveal,
+  type CommitVerificationResult,
+} from '../game/commitReveal';
 import {
   createInitialGameContext,
   transitionGameFsm,
   type AiGuessPayload,
+  type ComputerHideSetupPayload,
   type GameContext,
   type GameEvent,
 } from '../game/fsm';
+import {
+  LEVELS,
+  getLevelDefinition,
+  isLevelUnlocked,
+} from '../game/levels';
+import {
+  RULE_PRESETS,
+  type GuessCallType,
+} from '../game/rules/engine';
 import { renderBeliefGraphCanvas, renderVisionOverlay } from '../render/canvasOverlay';
+import { PixiHidingScene } from '../render/pixiHidingScene';
 import { DEFAULT_PROFILE_ID, IndexedDbProfileStore } from '../storage/profileStore';
+import {
+  IndexedDbProgressionStore,
+  applyMatchCompletionToProgression,
+  applyRoundCompletionToProgression,
+  createDefaultProgressionState,
+  type PlayerProgressionState,
+} from '../storage/progressionStore';
 import { BeliefFilter, type BeliefState } from '../tracking/beliefFilter';
 import { FeatureExtractor, type FrameFeatures } from '../vision/features';
 import {
@@ -41,7 +69,13 @@ import type {
   RevealVerificationResult,
   VisionFrameHands,
 } from '../vision/types';
-import { FA, formatSecondsFa, sideLabelFa, toPersianDigits } from './i18n';
+import {
+  FA,
+  formatSecondsFa,
+  handIndexLabelFa,
+  sideLabelFa,
+  toPersianDigits,
+} from './i18n';
 
 const CALIBRATION_CIRCLE = { x: 0.5, y: 0.5, radiusNorm: 0.085 };
 
@@ -56,8 +90,10 @@ export class GolYaPoochApp {
   private readonly beliefFilter = new BeliefFilter();
   private readonly ensemble = new HedgeEnsemble();
   private readonly profileStore = new IndexedDbProfileStore();
+  private readonly progressionStore = new IndexedDbProgressionStore();
   private readonly recorder = new SessionRecorder();
 
+  private progression: PlayerProgressionState = createDefaultProgressionState();
   private behaviorHistory: RoundBehaviorRecord[] = [];
   private videoEl!: HTMLVideoElement;
   private overlayCanvas!: HTMLCanvasElement;
@@ -68,6 +104,8 @@ export class GolYaPoochApp {
 
   private stageContainer!: HTMLElement;
   private stageBannerEl!: HTMLElement;
+  private pixiContainer!: HTMLElement;
+  private pixiScene: PixiHidingScene | null = null;
   private panelContainer!: HTMLElement;
   private debugContainer!: HTMLElement;
   private topbarStatusEl!: HTMLElement;
@@ -93,11 +131,19 @@ export class GolYaPoochApp {
   private stabilityPassed = false;
   private stabilityProgress = 0;
 
+  private activeTeamCallMode: GuessCallType = 'POOCH';
+  private selectedHandIndex: number | null = null;
+  private lastCommitVerification: CommitVerificationResult | null = null;
+  private showHowItWorks = false;
+  private lastUnlockedNoticeFa: string | null = null;
+
   private fps = 0;
   private inferenceMs = 0;
   private lastFrameTs = 0;
   private lastDebugRenderTs = 0;
   private rafId: number | null = null;
+  private uiTimerRafId: number | null = null;
+  private lastUiTimerTs = 0;
   private replayTimerId: number | null = null;
   private replayActive = false;
   private replayStatusText: string | null = null;
@@ -110,15 +156,30 @@ export class GolYaPoochApp {
     this.buildShell();
     this.bindGlobalListeners();
     this.renderUi();
-    void this.loadBehaviorProfile();
+    void this.loadStoredState();
   }
 
-  private async loadBehaviorProfile(): Promise<void> {
-    const profile = await this.profileStore.loadProfile(DEFAULT_PROFILE_ID);
-    if (!profile) return;
-    this.ensemble.restore(profile.ensemble);
-    this.behaviorHistory = profile.history;
-    if (this.ctx.state === 'MENU' || this.showDebug) {
+  private async loadStoredState(): Promise<void> {
+    const [profile, prog] = await Promise.all([
+      this.profileStore.loadProfile(DEFAULT_PROFILE_ID),
+      this.progressionStore.load(DEFAULT_PROFILE_ID),
+    ]);
+    if (profile) {
+      this.ensemble.restore(profile.ensemble);
+      this.behaviorHistory = profile.history;
+    }
+    this.progression = prog;
+    this.ctx = transitionGameFsm(this.ctx, {
+      type: 'SELECT_LEVEL',
+      levelId: prog.selectedLevelId,
+      teamHandsCount: prog.teamHandsCount,
+    });
+    if (
+      this.ctx.state === 'MENU' ||
+      this.ctx.state === 'LEVEL_SELECT' ||
+      this.ctx.state === 'STATS' ||
+      this.showDebug
+    ) {
       this.renderUi();
     }
   }
@@ -206,10 +267,26 @@ export class GolYaPoochApp {
 
     this.stageContainer.append(this.videoEl, this.overlayCanvas, this.stageBannerEl);
 
+    this.pixiContainer = document.createElement('section');
+    this.pixiContainer.className = 'pixi-stage hidden';
+    this.pixiContainer.setAttribute('aria-label', 'صحنه انیمیشن پنهان‌کاری رایانه');
+    this.pixiContainer.setAttribute('data-testid', 'pixi-stage');
+
+    this.pixiScene = new PixiHidingScene(this.pixiContainer);
+    this.pixiScene.setSelectHandler((handIndex) => {
+      if (this.ctx.state !== 'HUMAN_GUESS') return;
+      if (!this.ctx.commitPublic) return;
+      this.selectedHandIndex = handIndex;
+      const callType: GuessCallType = this.ctx.ruleSet.allowPoochCalls
+        ? this.activeTeamCallMode
+        : 'GOL';
+      this.dispatch({ type: 'HUMAN_GUESS_CALL', handIndex, callType });
+    });
+
     this.panelContainer = document.createElement('section');
     this.panelContainer.setAttribute('data-testid', 'screen-panel');
 
-    mainGrid.append(this.stageContainer, this.panelContainer);
+    mainGrid.append(this.stageContainer, this.pixiContainer, this.panelContainer);
 
     this.debugContainer = document.createElement('section');
     this.debugContainer.className = 'debug-panel hidden';
@@ -266,10 +343,156 @@ export class GolYaPoochApp {
     };
   }
 
+  private async prepareComputerHidesRound(): Promise<void> {
+    const level = getLevelDefinition(this.ctx.levelId);
+    const handsCount = this.ctx.ruleSet.handsCount;
+    const decision = chooseComputerHidingHand(
+      level,
+      handsCount,
+      this.progression.humanGuessHistory
+    );
+    const env = await createCommitEnvelope(decision.chosenHandIndex, handsCount);
+    const setup: ComputerHideSetupPayload = {
+      secretGolHandIndex: decision.chosenHandIndex,
+      commitPublic: env.publicInfo,
+      commitSecret: env.secret,
+      shuffleDurationMs: this.reducedMotion ? 600 : level.animation.shuffleDurationMs,
+    };
+
+    if (this.ctx.state === 'COMPUTER_HIDES' || this.ctx.state === 'HUMAN_GUESS') {
+      this.dispatch({ type: 'SET_COMPUTER_COMMIT', setup });
+    }
+  }
+
+  private startPixiComputerHides(): void {
+    const level = getLevelDefinition(this.ctx.levelId);
+    const handsCount = this.ctx.ruleSet.handsCount;
+    const choreo = generateHidingChoreography(level, handsCount, this.reducedMotion);
+    this.lastCommitVerification = null;
+    this.selectedHandIndex = null;
+    this.activeTeamCallMode = this.ctx.ruleSet.allowPoochCalls ? 'POOCH' : 'GOL';
+
+    const commitP = this.prepareComputerHidesRound();
+
+    if (!this.pixiScene) return;
+    void this.pixiScene.init().then(() => {
+      if (this.ctx.state !== 'COMPUTER_HIDES' || !this.pixiScene) return;
+      this.pixiScene.updateState({
+        phase: 'COMPUTER_HIDES',
+        handsCount,
+        selectedHandIndex: null,
+        openedEmptyHands: [],
+        revealedGolHandIndex: null,
+        allowPoochCalls: this.ctx.ruleSet.allowPoochCalls,
+        reducedMotion: this.reducedMotion,
+      });
+      this.pixiScene.startChoreography(choreo, () => {
+        void commitP.then(() => {
+          if (this.ctx.state === 'COMPUTER_HIDES') {
+            this.dispatch({ type: 'COMPUTER_SHUFFLE_DONE' });
+          }
+        });
+      });
+    });
+
+    this.ensureUiTimerLoop();
+  }
+
+  private syncPixiSceneState(): void {
+    if (!this.pixiScene) return;
+    if (!this.shouldShowPixiStage()) return;
+    const phase: 'COMPUTER_HIDES' | 'HUMAN_GUESS' | 'REVEALED' =
+      this.ctx.state === 'COMPUTER_HIDES'
+        ? 'COMPUTER_HIDES'
+        : this.ctx.state === 'HUMAN_GUESS'
+          ? 'HUMAN_GUESS'
+          : 'REVEALED';
+
+    void this.pixiScene.init().then(() => {
+      this.pixiScene?.updateState({
+        phase,
+        handsCount: this.ctx.ruleSet.handsCount,
+        selectedHandIndex: this.selectedHandIndex,
+        openedEmptyHands: this.ctx.teamGuessProgress.openedEmptyHands,
+        revealedGolHandIndex:
+          phase === 'REVEALED' ? this.ctx.computerSecretGolHandIndex : null,
+        allowPoochCalls: this.ctx.ruleSet.allowPoochCalls,
+        reducedMotion: this.reducedMotion,
+      });
+    });
+  }
+
+  private verifyAndRecordRoundResult(prevState: GameContext['state']): void {
+    // Verify commit-reveal when a computer-hides round finishes
+    if (
+      prevState === 'HUMAN_GUESS' &&
+      this.ctx.commitPublic &&
+      this.ctx.commitSecret
+    ) {
+      const pub = this.ctx.commitPublic;
+      const sec = this.ctx.commitSecret;
+      void verifyCommitReveal(pub.commitHex, sec.choice, sec.saltHex).then((ver) => {
+        this.lastCommitVerification = ver;
+        if (this.ctx.state === 'ROUND_RESULT') {
+          this.renderPanel();
+        }
+      });
+    }
+
+    // Update progression & stats
+    if (this.ctx.lastRoundWinner) {
+      const wasCompHiding = prevState === 'HUMAN_GUESS';
+      const guessRec =
+        wasCompHiding && this.ctx.lastHumanCalledHandIndex !== null
+          ? {
+              roundIndex: this.ctx.roundNumber,
+              handsCount: this.ctx.ruleSet.handsCount,
+              guessedHandIndex: this.ctx.lastHumanCalledHandIndex,
+              humanFoundGol: this.ctx.lastRoundWinner === 'HUMAN',
+            }
+          : undefined;
+
+      this.progression = applyRoundCompletionToProgression(this.progression, {
+        winner: this.ctx.lastRoundWinner,
+        wasComputerHiding: wasCompHiding,
+        reason: this.ctx.lastComputerHidesOutcomeReason,
+        ...(guessRec ? { guessRecord: guessRec } : {}),
+      });
+
+      const levelResolved =
+        this.ctx.bestOfMatches === 3
+          ? this.ctx.seriesWinner !== null
+          : this.ctx.matchWinner !== null;
+
+      if (levelResolved) {
+        const wonLevel =
+          (this.ctx.bestOfMatches === 3
+            ? this.ctx.seriesWinner
+            : this.ctx.matchWinner) === 'HUMAN';
+        const prevMax = this.progression.unlockedMaxLevel;
+        this.progression = applyMatchCompletionToProgression(this.progression, {
+          levelId: this.ctx.levelId,
+          humanWonLevel: wonLevel,
+          scoreDiff: this.ctx.humanScore - this.ctx.computerScore,
+        });
+        if (this.progression.unlockedMaxLevel > prevMax) {
+          const nextLvl = getLevelDefinition(this.progression.unlockedMaxLevel);
+          this.lastUnlockedNoticeFa = `سطح ${toPersianDigits(nextLvl.id)} (${nextLvl.nameFa}) باز شد!`;
+        } else {
+          this.lastUnlockedNoticeFa = null;
+        }
+      } else {
+        this.lastUnlockedNoticeFa = null;
+      }
+
+      void this.progressionStore.save(this.progression);
+    }
+  }
+
   private dispatch(event: GameEvent): void {
     const prevState = this.ctx.state;
 
-    // Record behavioral feedback when a valid round completes
+    // Record behavioral feedback when a human-hides round completes
     if (
       prevState === 'REVEAL_VERIFY' &&
       event.type === 'REVEAL_VERIFIED' &&
@@ -288,6 +511,18 @@ export class GolYaPoochApp {
       void this.saveBehaviorProfile();
     }
 
+    if (event.type === 'SELECT_LEVEL') {
+      this.progression = {
+        ...this.progression,
+        selectedLevelId: event.levelId,
+        ...(event.teamHandsCount ? { teamHandsCount: event.teamHandsCount } : {}),
+      };
+      void this.progressionStore.save(this.progression);
+    } else if (event.type === 'SET_TEAM_HANDS_COUNT') {
+      this.progression = { ...this.progression, teamHandsCount: event.handsCount };
+      void this.progressionStore.save(this.progression);
+    }
+
     this.ctx = transitionGameFsm(this.ctx, event);
 
     if (prevState !== this.ctx.state) {
@@ -298,6 +533,7 @@ export class GolYaPoochApp {
         this.lastPinchObs = [];
         this.lastRevealResult = null;
         this.lastBelief = null;
+        this.lastCommitVerification = null;
       } else if (this.ctx.state === 'HIDING') {
         this.featureExtractor.reset();
         this.lastBelief = this.beliefFilter.init(
@@ -310,7 +546,22 @@ export class GolYaPoochApp {
         this.stabilityTracker.reset();
         this.stabilityPassed = false;
         this.stabilityProgress = 0;
+      } else if (this.ctx.state === 'COMPUTER_HIDES') {
+        this.lastUnlockedNoticeFa = null;
+        this.showHowItWorks = false;
+        this.renderUi();
+        this.startPixiComputerHides();
+        return;
+      } else if (this.ctx.state === 'HUMAN_GUESS') {
+        this.ensureUiTimerLoop();
+        this.syncPixiSceneState();
+      } else if (this.ctx.state === 'ROUND_RESULT') {
+        this.verifyAndRecordRoundResult(prevState);
+        this.syncPixiSceneState();
+      } else {
+        this.pixiScene?.stopChoreography();
       }
+
       this.renderUi();
       return;
     }
@@ -326,14 +577,66 @@ export class GolYaPoochApp {
       return;
     }
 
+    if (event.type === 'HUMAN_GUESS_CALL') {
+      this.syncPixiSceneState();
+    }
+
     this.renderUi();
   }
 
+  private ensureUiTimerLoop(): void {
+    if (this.uiTimerRafId !== null) return;
+    this.lastUiTimerTs = performance.now();
+
+    const step = (now: number) => {
+      if (
+        this.ctx.state !== 'COMPUTER_HIDES' &&
+        this.ctx.state !== 'HUMAN_GUESS'
+      ) {
+        this.uiTimerRafId = null;
+        return;
+      }
+
+      const dtMs = Math.max(1, Math.min(100, now - this.lastUiTimerTs));
+      this.lastUiTimerTs = now;
+
+      // Avoid double-ticking if camera loop is already driving ticks
+      if (!this.camera.isStreaming || this.replayActive || this.ctx.practiceMode) {
+        if (this.ctx.state === 'COMPUTER_HIDES') {
+          if (this.ctx.phaseRemainingMs - dtMs <= 0 && !this.ctx.commitPublic) {
+            // Wait for Web Crypto commit envelope before advancing
+          } else {
+            this.dispatch({ type: 'TICK', dtMs });
+          }
+        } else if (this.ctx.state === 'HUMAN_GUESS') {
+          this.dispatch({ type: 'TICK', dtMs });
+        }
+      }
+
+      this.uiTimerRafId = requestAnimationFrame(step);
+    };
+
+    this.uiTimerRafId = requestAnimationFrame(step);
+  }
+
   private shouldShowCameraStage(): boolean {
+    if (this.shouldShowPixiStage()) return false;
+    if (this.ctx.practiceMode && !this.replayActive) return false;
     return (
       this.ctx.state !== 'SPLASH' &&
       this.ctx.state !== 'PERMISSION' &&
-      this.ctx.state !== 'CAMERA_ERROR'
+      this.ctx.state !== 'CAMERA_ERROR' &&
+      this.ctx.state !== 'LEVEL_SELECT' &&
+      this.ctx.state !== 'STATS' &&
+      this.ctx.state !== 'RULES'
+    );
+  }
+
+  private shouldShowPixiStage(): boolean {
+    return (
+      this.ctx.state === 'COMPUTER_HIDES' ||
+      this.ctx.state === 'HUMAN_GUESS' ||
+      (this.ctx.state === 'ROUND_RESULT' && this.ctx.commitPublic !== null)
     );
   }
 
@@ -377,12 +680,22 @@ export class GolYaPoochApp {
         this.lowFpsCounter = 0;
       }
 
+      if (this.ctx.state === 'PAUSED' || this.ctx.state === 'CAMERA_ERROR') {
+        return;
+      }
+
       if (
-        this.ctx.state === 'PAUSED' ||
-        this.ctx.state === 'CAMERA_ERROR' ||
-        !this.camera.isStreaming ||
-        this.videoEl.readyState < 2
+        (this.ctx.state === 'COMPUTER_HIDES' || this.ctx.state === 'HUMAN_GUESS') &&
+        !this.ctx.practiceMode
       ) {
+        if (this.ctx.state === 'COMPUTER_HIDES' && this.ctx.phaseRemainingMs - dtMs <= 0 && !this.ctx.commitPublic) {
+          return;
+        }
+        this.dispatch({ type: 'TICK', dtMs });
+        return;
+      }
+
+      if (!this.camera.isStreaming || this.videoEl.readyState < 2) {
         return;
       }
 
@@ -390,6 +703,18 @@ export class GolYaPoochApp {
     };
 
     this.rafId = requestAnimationFrame(step);
+  }
+
+  private getCurrentContactCount(): number {
+    const events = this.beliefFilter.getSnapshot().timeline;
+    let count = 0;
+    for (const ev of events) {
+      if (ev.type === 'CONTACT_START') count += 1;
+    }
+    if (this.lastFeatures?.interHand.inContact) {
+      count = Math.max(count, 1);
+    }
+    return count;
   }
 
   private processCameraFrame(now: number, dtMs: number): void {
@@ -507,10 +832,12 @@ export class GolYaPoochApp {
     ) {
       const willTimeoutHide =
         this.ctx.state === 'HIDING' && this.ctx.phaseRemainingMs - dtMs <= 0;
+      const contactCount = this.ctx.state === 'HIDING' ? this.getCurrentContactCount() : 0;
       this.dispatch({
         type: 'TICK',
         dtMs,
         maxLostDurationMs: this.lastHands?.maxLostDurationMs ?? 0,
+        ...(this.ctx.state === 'HIDING' ? { contactCount } : {}),
         ...(willTimeoutHide ? { aiGuess: this.computeAiGuess() } : {}),
       });
     } else {
@@ -573,9 +900,13 @@ export class GolYaPoochApp {
     this.replayStatusText = `بازپخش ${toPersianDigits(summary.totalFrames)} فریم آغاز شد…`;
 
     this.ctx = {
-      ...createInitialGameContext({ targetScore: this.ctx.config.targetScore }),
+      ...createInitialGameContext({
+        targetScore: this.ctx.config.targetScore,
+        enableTurnAlternation: false,
+      }),
       state: 'SHOW_GOL',
       calibrated: true,
+      practiceMode: false,
       phaseRemainingMs: 12_000,
     };
     this.renderUi();
@@ -614,7 +945,11 @@ export class GolYaPoochApp {
       } else if (this.ctx.state === 'HIDING') {
         this.lastBelief = this.beliefFilter.update(frame.features);
         if (idx >= summary.frames.length - 2) {
-          this.dispatch({ type: 'FINISH_HIDING', aiGuess: this.computeAiGuess() });
+          this.dispatch({
+            type: 'FINISH_HIDING',
+            aiGuess: this.computeAiGuess(),
+            contactCount: this.getCurrentContactCount(),
+          });
           this.dispatch({ type: 'PROCEED_TO_REVEAL' });
         }
       }
@@ -630,6 +965,7 @@ export class GolYaPoochApp {
           type: 'TICK',
           dtMs: 33,
           maxLostDurationMs: frame.hands.maxLostDurationMs,
+          ...(this.ctx.state === 'HIDING' ? { contactCount: this.getCurrentContactCount() } : {}),
         });
       }
 
@@ -708,6 +1044,17 @@ export class GolYaPoochApp {
       pinchEl.textContent = `تثبیت پینچ: ${toPersianDigits(framesDone)} از ${toPersianDigits(framesReq)} فریم پیاپی`;
     }
 
+    const contactEl = this.panelContainer.querySelector<HTMLElement>(
+      '[data-testid="contact-requirement-status"]'
+    );
+    if (contactEl && this.ctx.config.minHandContactsRequired > 0) {
+      const met = this.ctx.hidingContactCount >= this.ctx.config.minHandContactsRequired;
+      contactEl.className = `contact-req-pill ${met ? 'done' : 'pending'}`;
+      contactEl.textContent = met
+        ? 'الزام سطح حرفه‌ای: تماس دست‌ها ثبت شد ✓'
+        : 'الزام سطح حرفه‌ای: حداقل یک بار دست‌ها را به هم بزنید (در انتظار تماس…)';
+    }
+
     if (this.ctx.state === 'CALIBRATION') {
       const q = this.lastQuality;
       this.updateCheckItemInPlace('lighting', Boolean(q?.lightingOk), q?.lightingHintFa ?? null);
@@ -753,28 +1100,40 @@ export class GolYaPoochApp {
   }
 
   private renderUi(): void {
-    const showStage = this.shouldShowCameraStage();
-    this.stageContainer.classList.toggle('hidden', !showStage);
+    const showCam = this.shouldShowCameraStage();
+    const showPixi = this.shouldShowPixiStage();
+
+    this.stageContainer.classList.toggle('hidden', !showCam);
+    this.pixiContainer.classList.toggle('hidden', !showPixi);
+
     const mainGrid = this.panelContainer.parentElement;
-    mainGrid?.classList.toggle('with-camera', showStage);
+    mainGrid?.classList.toggle('with-camera', showCam);
+    mainGrid?.classList.toggle('with-pixi', showPixi);
 
     this.videoEl.classList.toggle('mirrored', this.mirrored);
     document.body.classList.toggle('reduced-motion', this.reducedMotion);
 
-    this.topbarStatusEl.textContent =
-      this.ctx.state === 'MENU' ||
+    const lvl = getLevelDefinition(this.ctx.levelId);
+    const inGame =
       this.ctx.state === 'SHOW_GOL' ||
       this.ctx.state === 'HIDING' ||
       this.ctx.state === 'COMPUTER_GUESS' ||
       this.ctx.state === 'REVEAL_VERIFY' ||
-      this.ctx.state === 'ROUND_RESULT'
-        ? `دور ${toPersianDigits(this.ctx.roundNumber)} | شما ${toPersianDigits(this.ctx.humanScore)} - ${toPersianDigits(this.ctx.computerScore)} رایانه (هدف: ${toPersianDigits(this.ctx.ruleSet.targetScore)})`
-        : `فاز ۲ — ${this.ctx.ruleSet.nameFa}`;
+      this.ctx.state === 'COMPUTER_HIDES' ||
+      this.ctx.state === 'HUMAN_GUESS' ||
+      this.ctx.state === 'ROUND_RESULT';
+
+    this.topbarStatusEl.textContent = inGame
+      ? `سطح ${toPersianDigits(lvl.id)} (${lvl.nameFa}) | دور ${toPersianDigits(this.ctx.roundNumber)} | شما ${toPersianDigits(this.ctx.humanScore)} - ${toPersianDigits(this.ctx.computerScore)} رایانه`
+      : `فاز ۳ — سطح ${toPersianDigits(lvl.id)}: ${lvl.nameFa} (${this.ctx.ruleSet.nameFa})`;
 
     this.renderPanel();
     this.renderDebugPanel();
-    if (showStage) {
+    if (showCam) {
       this.updateLiveOverlay();
+    }
+    if (showPixi) {
+      this.syncPixiSceneState();
     }
   }
 
@@ -803,6 +1162,15 @@ export class GolYaPoochApp {
         startBtn.setAttribute('data-testid', 'splash-start-btn');
         startBtn.addEventListener('click', () => this.dispatch({ type: 'GO_PERMISSION' }));
 
+        const practiceBtn = document.createElement('button');
+        practiceBtn.type = 'button';
+        practiceBtn.className = 'btn btn-emerald';
+        practiceBtn.textContent = FA.splashPracticeBtn;
+        practiceBtn.setAttribute('data-testid', 'splash-practice-btn');
+        practiceBtn.addEventListener('click', () =>
+          this.dispatch({ type: 'ENTER_PRACTICE_MENU' })
+        );
+
         const replayRow = document.createElement('div');
         replayRow.className = 'btn-row';
 
@@ -825,7 +1193,7 @@ export class GolYaPoochApp {
         );
 
         replayRow.append(replayBtn, transferReplayBtn);
-        card.append(badge, h2, p, startBtn, replayRow);
+        card.append(badge, h2, p, startBtn, practiceBtn, replayRow);
         break;
       }
 
@@ -857,6 +1225,14 @@ export class GolYaPoochApp {
           void this.handleRequestCamera();
         });
 
+        const practiceBtn = document.createElement('button');
+        practiceBtn.type = 'button';
+        practiceBtn.className = 'btn btn-emerald';
+        practiceBtn.textContent = FA.splashPracticeBtn;
+        practiceBtn.addEventListener('click', () =>
+          this.dispatch({ type: 'ENTER_PRACTICE_MENU' })
+        );
+
         const replayBtn = document.createElement('button');
         replayBtn.type = 'button';
         replayBtn.className = 'btn btn-secondary';
@@ -865,7 +1241,7 @@ export class GolYaPoochApp {
           this.startSessionReplay(createBuiltInSampleSession())
         );
 
-        btnRow.append(grantBtn, replayBtn);
+        btnRow.append(grantBtn, practiceBtn, replayBtn);
         card.append(h2, body, ul, btnRow);
 
         if (this.permissionError) {
@@ -981,15 +1357,27 @@ export class GolYaPoochApp {
       }
 
       case 'MENU': {
+        const lvl = getLevelDefinition(this.ctx.levelId);
         const h2 = document.createElement('h2');
         h2.textContent = FA.menuTitle;
 
         const note = document.createElement('p');
         note.textContent = FA.menuPhaseNote;
 
+        const levelBanner = document.createElement('div');
+        levelBanner.className = 'check-item ok';
+        levelBanner.setAttribute('data-testid', 'menu-active-level');
+        levelBanner.innerHTML = '';
+        const lblDiv = document.createElement('div');
+        lblDiv.textContent = `سطح فعلی: ${toPersianDigits(lvl.id)}. ${lvl.nameFa} — ${lvl.subtitleFa}`;
+        const modeSpan = document.createElement('span');
+        modeSpan.className = 'check-status ok';
+        modeSpan.textContent = this.ctx.practiceMode ? 'حالت تمرینی' : 'دوربین فعال';
+        levelBanner.append(lblDiv, modeSpan);
+
         const ruleSummary = document.createElement('div');
-        ruleSummary.className = 'check-item ok';
-        ruleSummary.textContent = `${this.ctx.ruleSet.nameFa}: ${this.ctx.ruleSet.descriptionFa}`;
+        ruleSummary.className = 'check-item';
+        ruleSummary.textContent = `${this.ctx.ruleSet.nameFa} (${toPersianDigits(this.ctx.ruleSet.handsCount)} دست): ${this.ctx.ruleSet.descriptionFa}`;
 
         const btnRow = document.createElement('div');
         btnRow.className = 'btn-row';
@@ -1001,13 +1389,34 @@ export class GolYaPoochApp {
         playBtn.setAttribute('data-testid', 'menu-play-btn');
         playBtn.addEventListener('click', () => this.dispatch({ type: 'START_GAME' }));
 
+        const levelsBtn = document.createElement('button');
+        levelsBtn.type = 'button';
+        levelsBtn.className = 'btn btn-secondary';
+        levelsBtn.textContent = FA.menuLevelsBtn;
+        levelsBtn.setAttribute('data-testid', 'menu-levels-btn');
+        levelsBtn.addEventListener('click', () => this.dispatch({ type: 'OPEN_LEVEL_SELECT' }));
+
+        const statsBtn = document.createElement('button');
+        statsBtn.type = 'button';
+        statsBtn.className = 'btn btn-secondary';
+        statsBtn.textContent = FA.menuStatsBtn;
+        statsBtn.setAttribute('data-testid', 'menu-stats-btn');
+        statsBtn.addEventListener('click', () => this.dispatch({ type: 'OPEN_STATS' }));
+
+        const rulesBtn = document.createElement('button');
+        rulesBtn.type = 'button';
+        rulesBtn.className = 'btn btn-secondary';
+        rulesBtn.textContent = FA.menuRulesBtn;
+        rulesBtn.setAttribute('data-testid', 'menu-rules-btn');
+        rulesBtn.addEventListener('click', () => this.dispatch({ type: 'OPEN_RULES' }));
+
         const calBtn = document.createElement('button');
         calBtn.type = 'button';
         calBtn.className = 'btn btn-secondary';
         calBtn.textContent = FA.menuRecalibrateBtn;
         calBtn.addEventListener('click', () => this.dispatch({ type: 'OPEN_CALIBRATION' }));
 
-        btnRow.append(playBtn, calBtn);
+        btnRow.append(playBtn, levelsBtn, statsBtn, rulesBtn, calBtn);
 
         const targetWrap = document.createElement('div');
         targetWrap.style.marginTop = '14px';
@@ -1056,7 +1465,7 @@ export class GolYaPoochApp {
         memRow.className = 'btn-row';
         const memStat = document.createElement('span');
         memStat.className = 'check-hint';
-        memStat.textContent = `تعداد دورهای ثبت‌شده در پروفایل محلی: ${toPersianDigits(this.behaviorHistory.length)}`;
+        memStat.textContent = `دورهای ثبت‌شده: ${toPersianDigits(this.progression.totalRoundsPlayed)} | بالاترین سطح باز: ${toPersianDigits(this.progression.unlockedMaxLevel)}`;
         const clearMemBtn = document.createElement('button');
         clearMemBtn.type = 'button';
         clearMemBtn.className = 'btn btn-secondary btn-compact';
@@ -1065,13 +1474,17 @@ export class GolYaPoochApp {
           this.behaviorHistory = [];
           this.ensemble.restore({ weights: {}, cumulativeLosses: {}, roundsUpdated: 0 });
           void this.profileStore.clearProfile(DEFAULT_PROFILE_ID);
-          this.renderUi();
+          void this.progressionStore.reset(DEFAULT_PROFILE_ID).then((fresh) => {
+            this.progression = fresh;
+            this.renderUi();
+          });
         });
         memRow.append(memStat, clearMemBtn);
 
         card.append(
           h2,
           note,
+          levelBanner,
           ruleSummary,
           btnRow,
           targetWrap,
@@ -1082,12 +1495,211 @@ export class GolYaPoochApp {
         break;
       }
 
+      case 'LEVEL_SELECT': {
+        const h2 = document.createElement('h2');
+        h2.textContent = FA.levelSelectTitle;
+
+        const unlockedMax = this.progression.unlockedMaxLevel;
+        const intro = document.createElement('p');
+        intro.textContent = `با پیروزی در هر سطح، سطح بعدی به‌صورت خودکار باز می‌شود. سطوح باز: تا سطح ${toPersianDigits(unlockedMax)}.`;
+
+        const grid = document.createElement('div');
+        grid.className = 'level-grid';
+        grid.setAttribute('data-testid', 'level-select-grid');
+
+        for (const lvl of LEVELS) {
+          const unlocked = isLevelUnlocked(lvl.id, unlockedMax);
+          const completed = this.progression.completedLevels.includes(lvl.id);
+          const selected = this.ctx.levelId === lvl.id;
+
+          const item = document.createElement('div');
+          item.className = `level-card${selected ? ' selected' : ''}${unlocked ? '' : ' locked'}`;
+          item.setAttribute('data-testid', `level-card-${lvl.id}`);
+
+          const header = document.createElement('div');
+          header.className = 'level-card-header';
+          const title = document.createElement('strong');
+          title.textContent = `سطح ${toPersianDigits(lvl.id)}: ${lvl.nameFa}`;
+          const badge = document.createElement('span');
+          badge.className = `check-status ${unlocked ? 'ok' : 'pending'}`;
+          badge.textContent = completed
+            ? 'تکمیل‌شده 🏆'
+            : unlocked
+              ? selected
+                ? 'انتخاب‌شده ✓'
+                : 'باز'
+              : 'قفل 🔒';
+          header.append(title, badge);
+
+          const desc = document.createElement('p');
+          desc.className = 'check-hint';
+          desc.textContent = lvl.descriptionFa;
+
+          const actions = document.createElement('div');
+          actions.className = 'btn-row';
+
+          const pickBtn = document.createElement('button');
+          pickBtn.type = 'button';
+          pickBtn.className = selected ? 'btn btn-primary btn-compact' : 'btn btn-secondary btn-compact';
+          pickBtn.textContent = selected ? 'شروع این سطح' : 'انتخاب سطح';
+          pickBtn.disabled = !unlocked;
+          pickBtn.setAttribute('data-testid', `select-level-btn-${lvl.id}`);
+          pickBtn.addEventListener('click', () => {
+            if (!unlocked) return;
+            this.dispatch({
+              type: 'SELECT_LEVEL',
+              levelId: lvl.id,
+              teamHandsCount: this.ctx.teamHandsCount,
+            });
+            this.dispatch({ type: 'START_GAME' });
+          });
+
+          actions.append(pickBtn);
+          item.append(header, desc, actions);
+          grid.append(item);
+        }
+
+        const backBtn = document.createElement('button');
+        backBtn.type = 'button';
+        backBtn.className = 'btn btn-secondary';
+        backBtn.textContent = FA.exitToMenuBtn;
+        backBtn.addEventListener('click', () => this.dispatch({ type: 'EXIT_TO_MENU' }));
+
+        card.append(h2, intro, grid, backBtn);
+        break;
+      }
+
+      case 'STATS': {
+        const h2 = document.createElement('h2');
+        h2.textContent = FA.statsTitle;
+
+        const p = this.progression;
+        const winRatePct =
+          p.totalRoundsPlayed > 0
+            ? Math.round((p.humanRoundsWon / p.totalRoundsPlayed) * 100)
+            : 0;
+
+        const grid = document.createElement('div');
+        grid.className = 'stats-grid';
+        grid.setAttribute('data-testid', 'stats-grid');
+
+        const tiles: Array<[string, string]> = [
+          ['بالاترین سطح باز', `${toPersianDigits(p.unlockedMaxLevel)} از ۵`],
+          ['مسابقات برده / کل', `${toPersianDigits(p.totalMatchesWon)} / ${toPersianDigits(p.totalMatchesPlayed)}`],
+          ['دورهای برده / کل', `${toPersianDigits(p.humanRoundsWon)} / ${toPersianDigits(p.totalRoundsPlayed)}`],
+          ['نرخ برد دورها', `${toPersianDigits(winRatePct)}٪`],
+          ['بیشترین برد پیاپی', toPersianDigits(p.humanBestWinStreak)],
+          ['گل مستقیم / پس از پوچ', `${toPersianDigits(p.humanDirectGolCount)} / ${toPersianDigits(p.humanCorrectAfterPoochCount)}`],
+        ];
+
+        for (const [label, val] of tiles) {
+          const tile = document.createElement('div');
+          tile.className = 'stat-tile';
+          const s = document.createElement('strong');
+          s.textContent = val;
+          const lbl = document.createElement('span');
+          lbl.className = 'check-hint';
+          lbl.textContent = label;
+          tile.append(s, lbl);
+          grid.append(tile);
+        }
+
+        const levelList = document.createElement('ul');
+        levelList.className = 'checklist';
+        for (const lvl of LEVELS) {
+          const st = p.perLevelStats[lvl.id] ?? { played: 0, won: 0, bestScoreDiff: 0 };
+          const li = document.createElement('li');
+          li.className = 'check-item';
+          li.textContent = `سطح ${toPersianDigits(lvl.id)} (${lvl.nameFa}): ${toPersianDigits(st.won)} برد از ${toPersianDigits(st.played)} مسابقه`;
+          levelList.append(li);
+        }
+
+        const backBtn = document.createElement('button');
+        backBtn.type = 'button';
+        backBtn.className = 'btn btn-secondary';
+        backBtn.textContent = FA.exitToMenuBtn;
+        backBtn.addEventListener('click', () => this.dispatch({ type: 'EXIT_TO_MENU' }));
+
+        card.append(h2, grid, levelList, backBtn);
+        break;
+      }
+
+      case 'RULES': {
+        const h2 = document.createElement('h2');
+        h2.textContent = FA.rulesTitle;
+
+        const teamCountWrap = document.createElement('div');
+        teamCountWrap.style.marginBottom = '12px';
+        const teamLbl = document.createElement('label');
+        teamLbl.textContent = 'تعداد دست‌ها در حالت تیمی (traditional-team):';
+        const teamSel = document.createElement('select');
+        teamSel.className = 'field-select';
+        teamSel.setAttribute('data-testid', 'team-hands-select');
+        for (const countOpt of [4, 6] as const) {
+          const opt = document.createElement('option');
+          opt.value = String(countOpt);
+          opt.textContent = `${toPersianDigits(countOpt)} دست`;
+          opt.selected = this.ctx.teamHandsCount === countOpt;
+          teamSel.append(opt);
+        }
+        teamSel.addEventListener('change', () => {
+          this.dispatch({
+            type: 'SET_TEAM_HANDS_COUNT',
+            handsCount: Number(teamSel.value) === 6 ? 6 : 4,
+          });
+        });
+        teamCountWrap.append(teamLbl, teamSel);
+
+        const list = document.createElement('ul');
+        list.className = 'checklist';
+        for (const rule of Object.values(RULE_PRESETS)) {
+          const li = document.createElement('li');
+          li.className = `check-item${this.ctx.ruleSet.id === rule.id ? ' ok' : ''}`;
+          const left = document.createElement('div');
+          const title = document.createElement('strong');
+          title.textContent = `${rule.nameFa} (${rule.id})`;
+          const desc = document.createElement('p');
+          desc.className = 'check-hint';
+          desc.textContent = `${rule.descriptionFa} | دست‌ها: ${toPersianDigits(rule.handsCount)} | سقف حدس: ${toPersianDigits(rule.maxGuessesPerRound)}`;
+          left.append(title, desc);
+
+          const useBtn = document.createElement('button');
+          useBtn.type = 'button';
+          useBtn.className = 'btn btn-secondary btn-compact';
+          useBtn.textContent = this.ctx.ruleSet.id === rule.id ? 'فعال ✓' : 'اعمال قانون';
+          useBtn.setAttribute('data-testid', `apply-rule-${rule.id}`);
+          useBtn.addEventListener('click', () => {
+            this.dispatch({ type: 'SET_CUSTOM_RULES', ruleSet: rule });
+          });
+
+          li.append(left, useBtn);
+          list.append(li);
+        }
+
+        const backBtn = document.createElement('button');
+        backBtn.type = 'button';
+        backBtn.className = 'btn btn-secondary';
+        backBtn.textContent = FA.exitToMenuBtn;
+        backBtn.addEventListener('click', () => this.dispatch({ type: 'EXIT_TO_MENU' }));
+
+        card.append(h2, teamCountWrap, list, backBtn);
+        break;
+      }
+
       case 'SHOW_GOL':
       case 'HIDING':
       case 'COMPUTER_GUESS':
-      case 'REVEAL_VERIFY': {
-        const hud = this.makeHudRow();
-        card.append(hud);
+      case 'REVEAL_VERIFY':
+      case 'COMPUTER_HIDES':
+      case 'HUMAN_GUESS': {
+        card.append(this.makeHudRow());
+        if (this.ctx.bestOfMatches === 3) {
+          const sb = document.createElement('div');
+          sb.className = 'series-banner';
+          sb.setAttribute('data-testid', 'series-banner');
+          sb.textContent = `سری بهترین از ۳ (سطح ۵) — مسابقه ${toPersianDigits(this.ctx.seriesMatchIndex + 1)} (${this.ctx.ruleSet.nameFa}) | برد سری: شما ${toPersianDigits(this.ctx.seriesHumanWins)} - ${toPersianDigits(this.ctx.seriesComputerWins)} رایانه`;
+          card.append(sb);
+        }
 
         if (this.ctx.state === 'SHOW_GOL') {
           const h2 = document.createElement('h2');
@@ -1104,15 +1716,32 @@ export class GolYaPoochApp {
           h2.textContent = FA.hidingIndicator;
           const p = document.createElement('p');
           p.textContent = FA.hidingInstruction;
+          card.append(h2, p);
+
+          if (this.ctx.config.minHandContactsRequired > 0) {
+            const met = this.ctx.hidingContactCount >= this.ctx.config.minHandContactsRequired;
+            const cPill = document.createElement('div');
+            cPill.className = `contact-req-pill ${met ? 'done' : 'pending'}`;
+            cPill.setAttribute('data-testid', 'contact-requirement-status');
+            cPill.textContent = met
+              ? 'الزام سطح حرفه‌ای: تماس دست‌ها ثبت شد ✓'
+              : 'الزام سطح حرفه‌ای: حداقل یک بار دست‌ها را به هم بزنید (در انتظار تماس…)';
+            card.append(cPill);
+          }
+
           const doneBtn = document.createElement('button');
           doneBtn.type = 'button';
           doneBtn.className = 'btn btn-primary';
           doneBtn.textContent = FA.finishHidingBtn;
           doneBtn.setAttribute('data-testid', 'finish-hiding-btn');
           doneBtn.addEventListener('click', () =>
-            this.dispatch({ type: 'FINISH_HIDING', aiGuess: this.computeAiGuess() })
+            this.dispatch({
+              type: 'FINISH_HIDING',
+              aiGuess: this.computeAiGuess(),
+              contactCount: this.getCurrentContactCount(),
+            })
           );
-          card.append(h2, p, doneBtn);
+          card.append(doneBtn);
         } else if (this.ctx.state === 'COMPUTER_GUESS') {
           const h2 = document.createElement('h2');
           h2.textContent = FA.guessPhaseTitle;
@@ -1142,12 +1771,144 @@ export class GolYaPoochApp {
           nextBtn.addEventListener('click', () => this.dispatch({ type: 'PROCEED_TO_REVEAL' }));
 
           card.append(h2, guessBox, nextBtn);
-        } else {
+        } else if (this.ctx.state === 'REVEAL_VERIFY') {
           const h2 = document.createElement('h2');
           h2.textContent = FA.revealPrompt;
           const p = document.createElement('p');
           p.textContent = FA.revealWaitingHands;
           card.append(h2, p);
+        } else if (this.ctx.state === 'COMPUTER_HIDES') {
+          const h2 = document.createElement('h2');
+          h2.textContent = FA.computerHidesTitle;
+          const p = document.createElement('p');
+          p.textContent = this.reducedMotion ? FA.computerHidesReducedDesc : FA.computerHidesDesc;
+
+          const commitBox = this.makeCommitFingerprintBox();
+          card.append(h2, p, commitBox);
+        } else {
+          // HUMAN_GUESS
+          const h2 = document.createElement('h2');
+          h2.textContent = FA.humanGuessTitle;
+          const p = document.createElement('p');
+          p.textContent = this.ctx.ruleSet.allowPoochCalls
+            ? FA.humanGuessPromptTeam
+            : FA.humanGuessPromptClassic;
+
+          const commitBox = this.makeCommitFingerprintBox();
+          card.append(h2, p, commitBox);
+
+          if (this.ctx.ruleSet.allowPoochCalls) {
+            const remGuesses = Math.max(
+              0,
+              this.ctx.ruleSet.maxGuessesPerRound - this.ctx.teamGuessProgress.guessesUsed
+            );
+            const modeBar = document.createElement('div');
+            modeBar.className = 'call-mode-bar';
+
+            const infoSpan = document.createElement('span');
+            infoSpan.setAttribute('data-testid', 'remaining-guesses-info');
+            infoSpan.textContent = `حدس‌های باقیمانده: ${toPersianDigits(remGuesses)} از ${toPersianDigits(this.ctx.ruleSet.maxGuessesPerRound)} | پوچ‌های درست: ${toPersianDigits(this.ctx.teamGuessProgress.poochCallsCount)}`;
+
+            const toggleRow = document.createElement('div');
+            toggleRow.className = 'btn-row';
+            toggleRow.style.marginTop = '0';
+
+            const poochModeBtn = document.createElement('button');
+            poochModeBtn.type = 'button';
+            poochModeBtn.className =
+              this.activeTeamCallMode === 'POOCH'
+                ? 'btn btn-sky btn-compact'
+                : 'btn btn-secondary btn-compact';
+            poochModeBtn.textContent = 'حالت ضربه: پوچ';
+            poochModeBtn.setAttribute('data-testid', 'mode-pooch-btn');
+            poochModeBtn.addEventListener('click', () => {
+              this.activeTeamCallMode = 'POOCH';
+              this.renderPanel();
+            });
+
+            const golModeBtn = document.createElement('button');
+            golModeBtn.type = 'button';
+            golModeBtn.className =
+              this.activeTeamCallMode === 'GOL'
+                ? 'btn btn-primary btn-compact'
+                : 'btn btn-secondary btn-compact';
+            golModeBtn.textContent = 'حالت ضربه: گل';
+            golModeBtn.setAttribute('data-testid', 'mode-gol-btn');
+            golModeBtn.addEventListener('click', () => {
+              this.activeTeamCallMode = 'GOL';
+              this.renderPanel();
+            });
+
+            toggleRow.append(poochModeBtn, golModeBtn);
+            modeBar.append(infoSpan, toggleRow);
+            card.append(modeBar);
+          }
+
+          const actionsGrid = document.createElement('div');
+          actionsGrid.className = 'hand-actions-grid';
+          actionsGrid.setAttribute('data-testid', 'hand-actions-grid');
+          const count = this.ctx.ruleSet.handsCount;
+
+          for (let i = 0; i < count; i++) {
+            const isOpened = this.ctx.teamGuessProgress.openedEmptyHands.includes(i);
+            const hCard = document.createElement('div');
+            hCard.className = `hand-action-card${isOpened ? ' opened' : ''}${this.selectedHandIndex === i ? ' selected' : ''}`;
+
+            const lbl = document.createElement('strong');
+            lbl.textContent = handIndexLabelFa(i, count);
+            hCard.append(lbl);
+
+            if (isOpened) {
+              const tag = document.createElement('span');
+              tag.className = 'check-hint';
+              tag.textContent = 'باز شد: پوچ ✓';
+              hCard.append(tag);
+            } else if (this.ctx.ruleSet.allowPoochCalls) {
+              const btnPair = document.createElement('div');
+              btnPair.className = 'hand-action-btns';
+
+              const poochBtn = document.createElement('button');
+              poochBtn.type = 'button';
+              poochBtn.className = 'btn btn-sky btn-compact';
+              poochBtn.textContent = FA.poochActionBtn;
+              poochBtn.disabled = !this.ctx.commitPublic;
+              poochBtn.setAttribute('data-testid', `hand-pooch-btn-${i}`);
+              poochBtn.addEventListener('click', () => {
+                this.selectedHandIndex = i;
+                this.dispatch({ type: 'HUMAN_GUESS_CALL', handIndex: i, callType: 'POOCH' });
+              });
+
+              const golBtn = document.createElement('button');
+              golBtn.type = 'button';
+              golBtn.className = 'btn btn-primary btn-compact';
+              golBtn.textContent = FA.golActionBtn;
+              golBtn.disabled = !this.ctx.commitPublic;
+              golBtn.setAttribute('data-testid', `hand-gol-btn-${i}`);
+              golBtn.addEventListener('click', () => {
+                this.selectedHandIndex = i;
+                this.dispatch({ type: 'HUMAN_GUESS_CALL', handIndex: i, callType: 'GOL' });
+              });
+
+              btnPair.append(poochBtn, golBtn);
+              hCard.append(btnPair);
+            } else {
+              const pickBtn = document.createElement('button');
+              pickBtn.type = 'button';
+              pickBtn.className = 'btn btn-primary btn-compact';
+              pickBtn.textContent = 'انتخاب این دست';
+              pickBtn.disabled = !this.ctx.commitPublic;
+              pickBtn.setAttribute('data-testid', `hand-guess-btn-${i}`);
+              pickBtn.addEventListener('click', () => {
+                this.selectedHandIndex = i;
+                this.dispatch({ type: 'HUMAN_GUESS_CALL', handIndex: i, callType: 'GOL' });
+              });
+              hCard.append(pickBtn);
+            }
+
+            actionsGrid.append(hCard);
+          }
+
+          card.append(actionsGrid);
         }
 
         const exitRow = document.createElement('div');
@@ -1158,6 +1919,7 @@ export class GolYaPoochApp {
         exitBtn.textContent = FA.exitToMenuBtn;
         exitBtn.addEventListener('click', () => {
           this.stopReplay();
+          this.pixiScene?.stopChoreography();
           this.dispatch({ type: 'EXIT_TO_MENU' });
         });
         exitRow.append(exitBtn);
@@ -1173,13 +1935,39 @@ export class GolYaPoochApp {
             ? FA.roundResultComputerWon
             : FA.roundResultHumanWon;
 
-        if (this.ctx.matchWinner !== null) {
+        if (this.ctx.bestOfMatches === 3) {
+          const sb = document.createElement('div');
+          sb.className = 'series-banner';
+          sb.textContent = `سری بهترین از ۳ — برد سری: شما ${toPersianDigits(this.ctx.seriesHumanWins)} - ${toPersianDigits(this.ctx.seriesComputerWins)} رایانه`;
+          card.append(sb);
+        }
+
+        const effectiveMatchWinner =
+          this.ctx.bestOfMatches === 3 ? this.ctx.seriesWinner : this.ctx.matchWinner;
+
+        if (effectiveMatchWinner !== null) {
           const winBanner = document.createElement('div');
           winBanner.className = 'hero-badge';
           winBanner.setAttribute('data-testid', 'match-winner-banner');
           winBanner.textContent =
-            this.ctx.matchWinner === 'HUMAN' ? FA.matchWinnerHuman : FA.matchWinnerComputer;
+            effectiveMatchWinner === 'HUMAN' ? FA.matchWinnerHuman : FA.matchWinnerComputer;
           card.append(winBanner);
+        } else if (this.ctx.matchWinner !== null && this.ctx.bestOfMatches === 3) {
+          const subBanner = document.createElement('div');
+          subBanner.className = 'hero-badge';
+          subBanner.textContent =
+            this.ctx.matchWinner === 'HUMAN'
+              ? 'شما این مسابقه از سری ۳ تایی را بردید!'
+              : 'رایانه این مسابقه از سری ۳ تایی را برد.';
+          card.append(subBanner);
+        }
+
+        if (this.lastUnlockedNoticeFa) {
+          const unlockBanner = document.createElement('div');
+          unlockBanner.className = 'hero-badge';
+          unlockBanner.setAttribute('data-testid', 'level-unlocked-banner');
+          unlockBanner.textContent = `🔓 ${this.lastUnlockedNoticeFa}`;
+          card.append(unlockBanner);
         }
 
         const targetProgress = document.createElement('p');
@@ -1187,40 +1975,59 @@ export class GolYaPoochApp {
         targetProgress.setAttribute('data-testid', 'match-target-progress');
         targetProgress.textContent = `امتیاز مسابقه (هدف ${toPersianDigits(this.ctx.ruleSet.targetScore)}): شما ${toPersianDigits(this.ctx.humanScore)} — رایانه ${toPersianDigits(this.ctx.computerScore)}`;
 
-        const probPct = Math.round((this.ctx.computerGuessProb ?? 0.5) * 100);
-        const detail = document.createElement('p');
-        detail.textContent = `گل در ${this.ctx.revealedHand ? sideLabelFa(this.ctx.revealedHand) : '-'} بود | حدس رایانه: ${this.ctx.computerGuess ? sideLabelFa(this.ctx.computerGuess) : '-'} (${toPersianDigits(probPct)}٪)`;
+        card.append(h2, targetProgress);
 
-        const explainBox = document.createElement('div');
-        explainBox.className = 'explanation-box';
-        explainBox.setAttribute('data-testid', 'round-explanation');
-        const explainTitle = document.createElement('strong');
-        explainTitle.textContent = 'تحلیل رایانه:';
-        const explainBody = document.createElement('p');
-        explainBody.textContent =
-          this.ctx.explanationFa ?? 'بر اساس نشانه‌های حرکتی تصمیم‌گیری شد.';
-        explainBox.append(explainTitle, explainBody);
+        // Computer-hides round details + cryptographic commit-reveal verification
+        if (this.ctx.commitPublic && this.ctx.commitSecret) {
+          const secretIdx = this.ctx.commitSecret.handIndex;
+          const reasonFa = this.describeComputerHidesReasonFa();
+          const detail = document.createElement('p');
+          detail.setAttribute('data-testid', 'computer-hides-result-detail');
+          detail.textContent = `گل در ${handIndexLabelFa(secretIdx, this.ctx.ruleSet.handsCount)} بود | ${reasonFa}`;
+          card.append(detail, this.makeCommitVerificationBox());
+        } else {
+          // Human-hides round details & timeline explanation
+          const probPct = Math.round((this.ctx.computerGuessProb ?? 0.5) * 100);
+          const detail = document.createElement('p');
+          detail.textContent = `گل در ${this.ctx.revealedHand ? sideLabelFa(this.ctx.revealedHand) : '-'} بود | حدس رایانه: ${this.ctx.computerGuess ? sideLabelFa(this.ctx.computerGuess) : '-'} (${toPersianDigits(probPct)}٪)`;
 
-        if (this.ctx.timelineEvents.length > 0) {
-          const tlList = document.createElement('ul');
-          tlList.className = 'timeline-list';
-          tlList.setAttribute('data-testid', 'round-timeline');
-          for (const item of this.ctx.timelineEvents) {
-            const li = document.createElement('li');
-            li.textContent = item;
-            tlList.append(li);
+          const explainBox = document.createElement('div');
+          explainBox.className = 'explanation-box';
+          explainBox.setAttribute('data-testid', 'round-explanation');
+          const explainTitle = document.createElement('strong');
+          explainTitle.textContent = 'تحلیل رایانه:';
+          const explainBody = document.createElement('p');
+          explainBody.textContent =
+            this.ctx.explanationFa ?? 'بر اساس نشانه‌های حرکتی تصمیم‌گیری شد.';
+          explainBox.append(explainTitle, explainBody);
+
+          if (this.ctx.timelineEvents.length > 0) {
+            const tlList = document.createElement('ul');
+            tlList.className = 'timeline-list';
+            tlList.setAttribute('data-testid', 'round-timeline');
+            for (const item of this.ctx.timelineEvents) {
+              const li = document.createElement('li');
+              li.textContent = item;
+              tlList.append(li);
+            }
+            explainBox.append(tlList);
           }
-          explainBox.append(tlList);
+
+          card.append(detail, explainBox);
         }
 
         const btnRow = document.createElement('div');
         btnRow.className = 'btn-row';
 
-        if (this.ctx.matchWinner === null) {
+        if (effectiveMatchWinner === null) {
           const nextBtn = document.createElement('button');
           nextBtn.type = 'button';
           nextBtn.className = 'btn btn-primary';
-          nextBtn.textContent = FA.nextRoundBtn;
+          nextBtn.setAttribute('data-testid', 'next-round-btn');
+          nextBtn.textContent =
+            this.ctx.matchWinner !== null && this.ctx.bestOfMatches === 3
+              ? FA.nextSeriesMatchBtn
+              : FA.nextRoundBtn;
           nextBtn.addEventListener('click', () => this.dispatch({ type: 'NEXT_ROUND' }));
           btnRow.append(nextBtn);
         }
@@ -1228,8 +2035,9 @@ export class GolYaPoochApp {
         const resetBtn = document.createElement('button');
         resetBtn.type = 'button';
         resetBtn.className =
-          this.ctx.matchWinner !== null ? 'btn btn-primary' : 'btn btn-secondary';
+          effectiveMatchWinner !== null ? 'btn btn-primary' : 'btn btn-secondary';
         resetBtn.textContent = FA.resetMatchBtn;
+        resetBtn.setAttribute('data-testid', 'reset-match-btn');
         resetBtn.addEventListener('click', () => this.dispatch({ type: 'RESET_MATCH' }));
 
         const exitBtn = document.createElement('button');
@@ -1239,7 +2047,7 @@ export class GolYaPoochApp {
         exitBtn.addEventListener('click', () => this.dispatch({ type: 'EXIT_TO_MENU' }));
 
         btnRow.append(resetBtn, exitBtn);
-        card.append(h2, targetProgress, detail, explainBox, btnRow);
+        card.append(btnRow);
         break;
       }
 
@@ -1249,6 +2057,7 @@ export class GolYaPoochApp {
         h2.textContent = 'دور باطل شد';
         const box = document.createElement('div');
         box.className = 'void-box';
+        box.setAttribute('data-testid', 'void-reason-box');
         box.textContent = this.ctx.voidMessageFa ?? 'دور به دلیل شرایط ردیابی باطل شد.';
 
         const btnRow = document.createElement('div');
@@ -1321,11 +2130,113 @@ export class GolYaPoochApp {
     this.panelContainer.append(card);
   }
 
+  private describeComputerHidesReasonFa(): string {
+    switch (this.ctx.lastComputerHidesOutcomeReason) {
+      case 'GOL_DIRECT':
+        return `گل مستقیم پیدا شد (+${toPersianDigits(this.ctx.ruleSet.scoring.correctGolNoWrongCalls)} امتیاز و تغییر نوبت)`;
+      case 'GOL_AFTER_POOCH':
+        return `گل پس از فراخوانی پوچ پیدا شد (+${toPersianDigits(this.ctx.ruleSet.scoring.correctGolAfterPoochCalls)} امتیاز و تغییر نوبت)`;
+      case 'POOCH_HIT_GOL':
+        return `فراخوانی «پوچ» روی دستِ دارای گل انجام شد (+${toPersianDigits(this.ctx.ruleSet.scoring.wrongGuessOrOutOfGuessesHiderPoints)} امتیاز رایانه)`;
+      case 'OUT_OF_GUESSES':
+        return `تعداد حدس‌ها یا زمان به پایان رسید (+${toPersianDigits(this.ctx.ruleSet.scoring.wrongGuessOrOutOfGuessesHiderPoints)} امتیاز رایانه)`;
+      default:
+        return `حدس اشتباه بود (+${toPersianDigits(this.ctx.ruleSet.scoring.wrongGuessOrOutOfGuessesHiderPoints)} امتیاز رایانه)`;
+    }
+  }
+
+  private makeCommitFingerprintBox(): HTMLElement {
+    const box = document.createElement('div');
+    box.className = 'commit-box';
+    box.setAttribute('data-testid', 'commit-fingerprint-box');
+
+    const title = document.createElement('div');
+    title.textContent = FA.commitLabel;
+
+    const fp = document.createElement('div');
+    fp.className = 'commit-fingerprint ltr-inline';
+    fp.setAttribute('data-testid', 'commit-fingerprint-value');
+    fp.textContent = this.ctx.commitPublic?.fingerprint ?? 'در حال تولید هش SHA-256…';
+
+    box.append(title, fp);
+    return box;
+  }
+
+  private makeCommitVerificationBox(): HTMLElement {
+    const box = document.createElement('div');
+    box.className = 'commit-box';
+    box.setAttribute('data-testid', 'commit-verification-box');
+
+    const topRow = document.createElement('div');
+    topRow.style.display = 'flex';
+    topRow.style.flexWrap = 'wrap';
+    topRow.style.alignItems = 'center';
+    topRow.style.justifyContent = 'space-between';
+    topRow.style.gap = '8px';
+
+    const title = document.createElement('strong');
+    title.textContent = 'راستی‌آزمایی رمزنگاری (Commit–Reveal)';
+
+    const badge = document.createElement('span');
+    badge.setAttribute('data-testid', 'commit-verify-badge');
+    if (this.lastCommitVerification) {
+      badge.className = `commit-verified-badge${this.lastCommitVerification.valid ? '' : ' invalid'}`;
+      badge.textContent = this.lastCommitVerification.statusFa;
+    } else {
+      badge.className = 'commit-verified-badge';
+      badge.textContent = FA.commitVerifying;
+    }
+
+    topRow.append(title, badge);
+
+    const details = document.createElement('div');
+    details.className = 'check-hint ltr-inline';
+    details.style.marginTop = '8px';
+    details.style.wordBreak = 'break-all';
+    if (this.ctx.commitPublic && this.ctx.commitSecret) {
+      details.textContent = `choice=${this.ctx.commitSecret.choice} | salt=${this.ctx.commitSecret.saltHex} | SHA-256=${this.ctx.commitPublic.commitHex.slice(0, 24)}…`;
+    }
+
+    const howBtn = document.createElement('button');
+    howBtn.type = 'button';
+    howBtn.className = 'btn btn-secondary btn-compact';
+    howBtn.style.marginTop = '10px';
+    howBtn.textContent = FA.howItWorksBtn;
+    howBtn.setAttribute('data-testid', 'how-it-works-btn');
+    howBtn.addEventListener('click', () => {
+      this.showHowItWorks = !this.showHowItWorks;
+      this.renderPanel();
+    });
+
+    box.append(topRow, details, howBtn);
+
+    if (this.showHowItWorks) {
+      const howBox = document.createElement('div');
+      howBox.className = 'how-it-works-box';
+      howBox.setAttribute('data-testid', 'how-it-works-box');
+      const hTitle = document.createElement('strong');
+      hTitle.textContent = COMMIT_REVEAL_EXPLANATION_FA.title;
+      const hSummary = document.createElement('p');
+      hSummary.textContent = COMMIT_REVEAL_EXPLANATION_FA.summary;
+      const ul = document.createElement('ul');
+      for (const stepText of COMMIT_REVEAL_EXPLANATION_FA.steps) {
+        const li = document.createElement('li');
+        li.textContent = stepText;
+        ul.append(li);
+      }
+      howBox.append(hTitle, hSummary, ul);
+      box.append(howBox);
+    }
+
+    return box;
+  }
+
   private makeHudRow(): HTMLElement {
     const row = document.createElement('div');
     row.className = 'hud-row';
+    row.setAttribute('data-testid', 'game-hud');
 
-    const makeStat = (label: string, val: string, isTimer = false) => {
+    const makeStat = (label: string, val: string, testId?: string, isTimer = false) => {
       const box = document.createElement('div');
       box.className = 'hud-stat';
       const l = document.createElement('div');
@@ -1334,20 +2245,25 @@ export class GolYaPoochApp {
       const v = document.createElement('div');
       v.className = 'hud-stat-value';
       if (isTimer) v.setAttribute('data-hud-timer', 'true');
+      if (testId) v.setAttribute('data-testid', testId);
       v.textContent = val;
       box.append(l, v);
       return box;
     };
 
+    const lvl = getLevelDefinition(this.ctx.levelId);
     row.append(
+      makeStat('سطح', `${toPersianDigits(lvl.id)}. ${lvl.nameFa}`, 'hud-level'),
       makeStat(
-        `امتیاز شما (از ${toPersianDigits(this.ctx.ruleSet.targetScore)})`,
-        toPersianDigits(this.ctx.humanScore)
+        `شما (هدف ${toPersianDigits(this.ctx.ruleSet.targetScore)})`,
+        toPersianDigits(this.ctx.humanScore),
+        'hud-human-score'
       ),
-      makeStat('زمان مرحله', formatSecondsFa(this.ctx.phaseRemainingMs), true),
+      makeStat('زمان مرحله', formatSecondsFa(this.ctx.phaseRemainingMs), 'hud-timer', true),
       makeStat(
-        `امتیاز رایانه (از ${toPersianDigits(this.ctx.ruleSet.targetScore)})`,
-        toPersianDigits(this.ctx.computerScore)
+        `رایانه (هدف ${toPersianDigits(this.ctx.ruleSet.targetScore)})`,
+        toPersianDigits(this.ctx.computerScore),
+        'hud-computer-score'
       )
     );
     return row;
@@ -1374,7 +2290,7 @@ export class GolYaPoochApp {
     const belief = this.lastBelief ?? this.beliefFilter.getBelief();
     const behav = this.ensemble.predict(this.behaviorHistory);
     return [
-      ['FSM State', this.ctx.state],
+      ['FSM State', `${this.ctx.state} (L${this.ctx.levelId})`],
       ['FPS / Infer', `${this.fps.toFixed(1)} fps / ${this.inferenceMs.toFixed(1)} ms`],
       [
         'Left Hand',
@@ -1391,7 +2307,7 @@ export class GolYaPoochApp {
       [
         'Inter-Hand',
         this.lastFeatures
-          ? `${this.lastFeatures.interHand.inContact ? 'CONTACT' : 'APART'} (d=${this.lastFeatures.interHand.minLandmarkDistanceNorm.toFixed(2)}, dur=${Math.round(this.lastFeatures.interHand.contactDurationMs)}ms)`
+          ? `${this.lastFeatures.interHand.inContact ? 'CONTACT' : 'APART'} (d=${this.lastFeatures.interHand.minLandmarkDistanceNorm.toFixed(2)}, contacts=${this.ctx.hidingContactCount})`
           : 'N/A',
       ],
       [
@@ -1403,8 +2319,8 @@ export class GolYaPoochApp {
         `P(L)=${(behav.pLeft * 100).toFixed(0)}% (${this.behaviorHistory.length} rounds)`,
       ],
       [
-        'Recorder',
-        `${this.recorder.isRecording ? 'REC' : 'IDLE'} (${this.recorder.frameCount} frames)`,
+        'Commit Hash',
+        this.ctx.commitPublic ? this.ctx.commitPublic.fingerprint : 'N/A',
       ],
     ];
   }
