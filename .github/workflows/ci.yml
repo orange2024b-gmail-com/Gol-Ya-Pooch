@@ -24,6 +24,7 @@ jobs:
 
       - name: Verify self-hosted assets exist
         run: |
+          test -f public/favicon.svg
           test -f public/mediapipe/hand_landmarker.task
           test -f public/mediapipe/wasm/vision_wasm_internal.wasm
           test -f public/fonts/vazirmatn-arabic-400-normal.woff2

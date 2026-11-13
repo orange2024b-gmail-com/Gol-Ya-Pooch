@@ -1,51 +1,141 @@
-# Gol Ya Pooch Architecture Notes (Phases 1–4)
+# Gol Ya Pooch Architecture Notes (Phases 1–5)
 
-## Design Goals
+## 1. Design Principles & Zero-External-Runtime Guarantee
 
-1. **Zero External Runtime Requests:** All assets required at runtime (`@mediapipe/tasks-vision` WASM files, `hand_landmarker.task`, and `Vazirmatn` `.woff2` fonts) live in `public/` and are copied verbatim into `dist/`. PixiJS scenes draw procedural vector art with zero external textures/CDNs. Vite builds with `base: './'` so static deployment works on both localhost and GitHub Pages subpaths.
-2. **Privacy by Construction:** Camera frames are drawn onto an in-memory `HTMLCanvasElement` for typed-array `ImageData` color/lighting checks and passed to the local MediaPipe WASM runtime. `SessionRecorder` (`src/vision/recorder.ts`), `IndexedDbProfileStore` (`src/storage/profileStore.ts`), and `IndexedDbProgressionStore` (`src/storage/progressionStore.ts`) only store numeric landmarks, derived kinematics, game events, progression/stats scalars, and expert weights — **never images or video**.
-3. **Resilient Hand Identity (`src/vision/handTracker.ts`):** MediaPipe's single-frame `handedness` classification frequently swaps when hands cross. `HandIdentityTracker` tracks `LEFT` and `RIGHT` wrists using velocity-predicted spatial positions (computed from raw wrist landmarks to avoid smoothing lag) and optimal Hungarian assignment (`hungarianAssign`), treating MediaPipe `handedness` purely as a weak tie-breaker (`0.001`).
-4. **Explicit Game FSM (`src/game/fsm.ts`):** Game state transitions are pure functions `(GameContext, GameEvent) => GameContext`, making every phase timeout, void-round rule (including Level 3's `NO_HAND_CONTACT`), tab-hidden pause/resume, recoverable camera loss, and full `HUMAN_HIDES` <-> `COMPUTER_HIDES` turn alternation deterministic and directly testable with unit tests and `fast-check` property-based tests.
+1. **Zero External Runtime Requests:** All core assets live under `public/` and are copied into `dist/` at build time (`scripts/sync-assets.mjs` + Vite public copy):
+   - `public/mediapipe/hand_landmarker.task` & `public/mediapipe/wasm/*` (`@mediapipe/tasks-vision@1.2.3`)
+   - `public/ort/ort-wasm-simd-threaded.{wasm,mjs}` (`onnxruntime-web@1.31.1`)
+   - `public/models/temporal_tracker.onnx` (31 KB) & `public/models/fusion_config.json`
+   - `public/fonts/vazirmatn.css` + `vazirmatn-{arabic,latin}-{400,500,700,800}-normal.woff2`
+   - `public/favicon.svg` + procedural inline SVG brand logo (`src/render/brandLogo.ts`) + procedural PixiJS v8 vector hands (`src/render/pixiHidingScene.ts`) + procedural Web Audio synthesizer (`src/audio/soundEngine.ts`).
+   - Vite builds with `base: './'` (or `VITE_BASE_PATH` on GitHub Pages) so deployment works cleanly at root or subpath.
 
-## Phase 2: Tracking, Behavioral Modeling, and Rule Engine
+2. **Privacy & No-Image/No-Video Proof (Verifiable End-to-End):**
+   - **Camera Capture (`src/camera/cameraManager.ts`):** `getUserMedia({ audio: false, video: ... })` renders only to a local `<video>` element and a `320x240` in-memory `HTMLCanvasElement` for typed-array `ImageData` HSV/CIE Lab color sampling and MediaPipe inference. Frames are discarded immediately after each tick.
+   - **Recording & Round Logging (`src/vision/recorder.ts`, `src/storage/roundLogStore.ts`):**
+     - `IndexedDbRoundLogStore` defaults to `consentEnabled: false`.
+     - `assertNumericOnlyPayload` recursively rejects any media-like property names (`image`, `video`, `frame`, `canvas`, `blob`, `pixels`, `rgba`, etc.), typed arrays / `ArrayBuffer`, DOM media objects, and `data:image/` or `data:video/` URIs before persistence, during JSON export, and on JSON import.
+   - **Optional LLM Client (`src/llm/commentaryClient.ts`):**
+     - Disabled (`enabled: false`) by default.
+     - `assertTextOnlyLlmPayload` enforces at runtime that only plain-text `messages` (`system` + `user` strings) are serialized; any image key, multimodal `image_url`, `data:image/`/`data:video/` string, or binary buffer throws and falls back to template commentary.
+   - **Playwright Network Audit (`tests/e2e/phase1..5.spec.ts`):** Every E2E test attaches a `page.on('request')` listener verifying `0` requests outside the local origin (`127.0.0.1:4173`), `data:`, and `blob:`.
 
-5. **Per-Frame Kinematic & Geometric Features (`src/vision/features.ts`):**
-   - `FeatureExtractor` computes palm-size-normalized joint flexion angles (MCP, PIP, DIP) and total curl per finger, fist compactness (2D convex-hull area + mean fingertip-to-palm-center distance), sliding-window compactness deltas, wrist velocity/acceleration/jitter, 3D palm normal & depth proxies, inter-hand landmark proximity & contact duration, partial-opening events (brief curl dip followed by recovery), per-hand gol-sighting scores, and frame quality flags.
-   - **Honest Physical Limitation:** Muscle tension itself is **not directly observable** at standard webcam resolution. Squeezing, relaxing, and hand tension are **approximated** through finger geometry (curl and fist compactness) and temporal dynamics (sliding-window compactness deltas and wrist jitter/tremor).
+---
 
-6. **Event Detector & Bayesian HMM Belief Filter (`src/tracking/eventDetector.ts`, `src/tracking/beliefFilter.ts`):**
-   - `EventDetector` converts frame-by-frame `FrameFeatures` during `HIDING` into a structured timeline of discrete events (`CONTACT_START`, `CONTACT_END`, `PARTIAL_OPENING`, `GOL_SIGHTING`, `OCCLUSION_START`, `OCCLUSION_END`, `COMPACTNESS_SHIFT`).
-   - `BeliefFilter` runs a 2-state discrete HMM forward pass over `{LEFT, RIGHT}` and exposes live belief solely inside the toggleable Debug Overlay (`D` key).
+## 2. Layered Module Map
 
-7. **Behavioral Experts & Hedge Ensemble (`src/ai/behavior/`, `src/ai/ensemble.ts`, `src/ai/guesser.ts`):**
-   - Experts predict `P(LEFT)` from past round choices (`frequency`, `ngram`, `markov`, `habituation`), mixed via `HedgeEnsemble`, and fused with tracking belief in log-odds space by `Guesser`.
+```
+src/
+├─ main.ts                      # Mounts GolYaPoochApp
+├─ app/
+│  ├─ appController.ts          # Screen routing, camera/Pixi loop orchestration, settings, UI
+│  ├─ benchmark.ts              # In-app DeviceBenchmark (?benchmark=1): RAF FPS, features, HMM, ORT-Web
+│  └─ i18n.ts                   # Persian RTL copy, Persian digits, RULES_BOOK_SECTIONS_FA
+├─ audio/
+│  └─ soundEngine.ts            # Procedural Web Audio API cues + localStorage mute toggle
+├─ camera/
+│  └─ cameraManager.ts          # getUserMedia (1280x720 -> 640x480 fallback), device switch, loss callback
+├─ vision/
+│  ├─ handTracker.ts            # MediaPipe HandLandmarker + One-Euro filter + Hungarian left/right tracking
+│  ├─ oneEuro.ts                # Adaptive One-Euro smoother
+│  ├─ golDetector.ts            # HSV + CIE Lab Mahalanobis color model, pinch ROI, palm open-reveal verification
+│  ├─ features.ts               # Normalized finger curl, convex-hull compactness, velocity/jitter, inter-hand distance
+│  ├─ quality.ts                # Luminance, contrast, Laplacian blur, 1s calibration stability
+│  ├─ recorder.ts               # Numeric-only RecordedSession capture & camera-free deterministic replay
+│  └─ sampleSession.ts          # Built-in Phase 1 & Phase 2 deterministic replay sessions
+├─ tracking/
+│  ├─ eventDetector.ts          # Discrete hiding events (CONTACT, PARTIAL_OPENING, GOL_SIGHTING, OCCLUSION)
+│  ├─ beliefFilter.ts           # 2-state Bayesian HMM forward pass over {LEFT, RIGHT}
+│  ├─ temporalFeatures.ts       # Fixed-rate 10 Hz resampling/padding into [64 x 24] tensor
+│  └─ temporalModel.ts          # Self-hosted onnxruntime-web WASM inference + logistic HMM fusion + fallback
+├─ ai/
+│  ├─ behavior/                 # Frequency, n-gram (1..3), Markov (WSLS), habituation experts
+│  ├─ ensemble.ts               # Multiplicative-weights (Hedge) expert mixer
+│  ├─ guesser.ts                # Log-odds fusion of (HMM + ONNX) tracking & behavioral prior + FA explanation
+│  └─ hider.ts                  # Unbiased crypto hiding (L1–4), bounded-exploitation Hedge (L5), choreography
+├─ game/
+│  ├─ fsm.ts                    # Pure transitionGameFsm (19 states), timeouts, void rules, pause/recover
+│  ├─ levels.ts                 # Levels 1–5 definitions & unlock progression
+│  ├─ commitReveal.ts           # Web Crypto crypto.getRandomValues 16B salt + SHA-256 commitment/verification
+│  └─ rules/                    # Schema-validated JSON rules (classic-1v1, traditional-team, custom)
+├─ render/
+│  ├─ brandLogo.ts              # Custom Persian Shamseh + cupped hands + golden-pearl gol inline SVG
+│  ├─ canvasOverlay.ts          # Landmarks, calibration circle, pinch ring, debug belief trace graph
+│  └─ pixiHidingScene.ts        # PixiJS v8 procedural 2/4/6-hand animations & touch targets
+├─ storage/
+│  ├─ profileStore.ts           # IndexedDB behavioral ensemble & history
+│  ├─ progressionStore.ts       # IndexedDB unlocked levels & round/match stats
+│  └─ roundLogStore.ts          # Consent-gated numeric round log store & JSON export/import
+└─ llm/
+   └─ commentaryClient.ts       # Optional OpenAI-compatible text-only host commentary (3s AbortController)
+```
 
-## Phase 3: Computer Hiding, PixiJS v8, Commit–Reveal, Rules & Levels 1–5
+---
 
-8. **PixiJS v8 Animated Hiding Scenes (`src/render/pixiHidingScene.ts`, `src/ai/hider.ts`):**
-   - Procedural vector-art stylized closed fists, open palms, and glowing gol pearl supporting 2-hand (`classic-1v1`) and 4–6-hand (`traditional-team`) layouts across mobile portrait and desktop viewports.
-   - Level-driven choreography generator (`generateHidingChoreography`) produces swaps, feints (`FEINT_SWAP`), uneven-tempo bursts/pauses, and multi-hand misdirection (`MISDIRECTION_CROSS`), collapsing to a calm static pause when `reducedMotion` is enabled.
+## 3. Vision, Tracking & Machine Learning Notes
 
-9. **Cryptographic Commit–Reveal Fairness (`src/game/commitReveal.ts`):**
-   - Before the human guesses, `createCommitEnvelope` generates a 16-byte random salt via `crypto.getRandomValues` and computes `SHA-256(choice + ":" + salt)` via Web Crypto `subtle.digest`.
-   - A short fingerprint is displayed prior to guessing; after guessing, `verifyCommitReveal` recomputes the digest client-side, renders `✓ تأیید شد`, and provides a Persian "این چطور کار می‌کند؟" explanation.
+- **Resilient Hand Identity (`HandIdentityTracker`):** Uses velocity-predicted wrist positions computed on raw coordinates and optimal Hungarian assignment (`hungarianAssign`), treating MediaPipe `handedness` strictly as a `0.001` weak prior so crossing hands never swap identities.
+- **Physical Limitation Transparency:** Muscle tension itself is not directly observable at standard webcam resolution; squeezing and relaxing are **approximated** from finger flexion angles, 2D convex-hull fist compactness, sliding-window compactness deltas, and wrist jitter.
+- **Offline Training & Ship Gate (`training/`):**
+  - Strictly player-grouped split (`split_by_player`, zero overlap between train/val/test players).
+  - Compact Conv1D + GRU (`TemporalTrackerNet`) exported to `public/models/temporal_tracker.onnx` (`31 KB`) with validation-calibrated logistic fusion (`hmmWeight`, `temporalWeight`, `bias`).
+  - Ship gate requires fused held-out test accuracy to exceed the HMM-only baseline (`90.12%` vs `75.93%` on the 162-round held-out test split, ECE improved from `0.2022` to `0.0599`).
 
-10. **Computer Hiding Policy, Levels 1–5, and Declarative Rules (`src/ai/hider.ts`, `src/game/levels.ts`, `src/game/rules/`):**
-    - `traditional-team.json` and `custom.json` extend the schema-validated declarative rule engine (`evaluateGuessCallStep`, `resolveRoundByRules`) with `پوچ` / `گل` multi-guess scoring (`+2`, `+0`, `+1`).
-    - Levels 1–4 sample uniformly via unbiased `crypto.getRandomValues` rejection sampling. Level 5 (`استاد گل‌گیر`) runs a Best-of-3 series (`classic-1v1` and `traditional-team`) and pairs an online Hedge human-guesser predictor with a bounded-exploitation best response (`|p_i - 1/K| <= min(0.18, 0.45 / K)`) so the computer stays unpredictable.
-    - Level progression and match/round statistics are stored strictly numerically in IndexedDB via `IndexedDbProgressionStore`.
+---
 
-## Phase 4: Consent-Gated Logging, Offline Training & Self-Hosted ONNX Inference
+## 4. Optional LLM Commentary & Serverless Proxy Option (Documented Only)
 
-11. **Consent-Gated Numeric Round Logging (`src/storage/roundLogStore.ts`):**
-    - `IndexedDbRoundLogStore` defaults to `consentEnabled: false` and refuses to persist any round until the player opts in via the Persian Consent screen or Settings.
-    - `assertNumericOnlyPayload` recursively rejects any media keys (`image`, `video`, `canvas`, `pixels`, `rgba`, `blob`, `base64`), typed arrays, DOM media objects, or `data:image/` / `data:video/` URIs before IndexedDB storage and during JSON export/import.
-    - Logged rounds record level, rule set, initial hand, 10 Hz resampled `[64 x 24]` feature sequence, raw numeric per-frame vectors, event timeline, HMM belief trace, final guess breakdown, verified ground truth, and timings.
+`src/llm/commentaryClient.ts` is **OFF by default**. When enabled in Settings:
+- Sends **only** a short Persian text summary (`system` + `user` messages) of the round/level/match outcome.
+- Enforces a hard **3000 ms** timeout via `AbortController`; any timeout, network failure, HTTP non-2xx, or malformed payload silently falls back to `generateTemplateCommentary(event)`.
+- **Key Management Options for Static Hosting (GitHub Pages):**
+  1. **User-supplied personal API key:** Stored strictly in the user's browser `localStorage` (`gol-ya-pooch:llm-config`), never committed or embedded in source code.
+  2. **Tiny Serverless Proxy (Recommended if sharing a hosted key — not built in this static repo):** Deploy a lightweight edge function (e.g., Cloudflare Worker or Vercel Edge Function) that holds the provider secret in server environment variables, enforces origin CORS + rate limiting + text-only schema validation, and forwards the OpenAI-compatible request:
 
-12. **Offline Python 3.11+ Pipeline (`/training/`) & Ship Gate:**
-    - `training/gol_training/` loads exported JSON round logs (or generates a deterministic multi-player dataset), splits strictly by player (`split_by_player` with zero leakage), trains a compact **Conv1D + GRU** temporal tracker (`TemporalTrackerNet`), calibrates logistic fusion weights (`[w_hmm, w_temporal, bias]`) on the validation split, and exports `temporal_tracker.onnx` (31 KB).
-    - **Ship Gate:** `public/models/temporal_tracker.onnx` and `public/models/fusion_config.json` ship only if the fused model strictly beats the HMM filter-only baseline on the held-out player test split.
+```ts
+// Reference Cloudflare Worker / Edge proxy blueprint (do NOT embed secrets in client code)
+export default {
+  async fetch(request: Request, env: { LLM_API_KEY: string; LLM_ENDPOINT: string }): Promise<Response> {
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': 'https://<your-username>.github.io',
+          'Access-Control-Allow-Methods': 'POST, OPTIONS',
+          'Access-Control-Allow-Headers': 'Content-Type',
+        },
+      });
+    }
+    if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
 
-13. **Browser ONNX Runtime Web WASM Integration (`src/tracking/temporalModel.ts`, `src/ai/guesser.ts`):**
-    - `onnxruntime-web@1.31.1` WASM binaries (`ort-wasm-simd-threaded.wasm`, `ort-wasm-simd-threaded.mjs`) are self-hosted under `public/ort/` and resolved via `document.baseURI` with zero external CDN requests.
-    - `TemporalModelRunner` runs warmup on load, executes inference on the resampled 10 Hz hiding sequence (`< 1 ms` warm in Node/desktop Chromium), and fuses with the HMM belief filter via `fuseHmmAndTemporal`. Any missing, HTML-redirected, corrupt, or ship-gate-failed model automatically falls back to HMM-only without crashing.
+    const body = (await request.json()) as { model?: string; messages?: Array<{ role: string; content: unknown }> };
+    // Enforce text-only messages on proxy too
+    if (!Array.isArray(body.messages) || body.messages.some((m) => typeof m.content !== 'string')) {
+      return new Response('Text-only messages required', { status: 400 });
+    }
+
+    const upstream = await fetch(env.LLM_ENDPOINT, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${env.LLM_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: body.model ?? 'gpt-4o-mini',
+        messages: body.messages.slice(0, 4),
+        max_tokens: 140,
+        temperature: 0.7,
+      }),
+    });
+
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: {
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': 'https://<your-username>.github.io',
+      },
+    });
+  },
+};
+```
+
+In the game Settings UI, the player simply enters the Worker URL as **Endpoint** and leaves the **API Key** field blank.
