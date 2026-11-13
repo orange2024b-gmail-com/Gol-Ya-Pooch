@@ -117,8 +117,8 @@ export const DEFAULT_FEATURE_CONFIG: FeatureExtractorConfig = {
   contactEnterDistNorm: 0.42,
   contactExitDistNorm: 0.52,
   closedCurlThreshold: 0.36,
-  partialOpenMinDrop: 0.09,
-  partialOpenRecoveryRatio: 0.5,
+  partialOpenMinDrop: 0.055,
+  partialOpenRecoveryRatio: 0.45,
   partialOpenMaxDurationMs: 900,
   minConfidenceThreshold: 0.55,
 };
@@ -574,8 +574,9 @@ export class FeatureExtractor {
         state.dipMinCurl = totalCurl;
         state.dipBaselineCurl = state.baselineCurl;
       } else {
-        // Slowly adapt closed baseline when not in a dip
-        state.baselineCurl = 0.85 * state.baselineCurl + 0.15 * totalCurl;
+        // Track fist closing quickly upward, and adapt slowly downward so brief dips stand out
+        const alpha = totalCurl > state.baselineCurl ? 0.35 : 0.04;
+        state.baselineCurl = (1 - alpha) * state.baselineCurl + alpha * totalCurl;
       }
     } else {
       state.dipMinCurl = Math.min(state.dipMinCurl, totalCurl);
@@ -592,7 +593,7 @@ export class FeatureExtractor {
         totalCurl >= state.dipMinCurl + drop * this.config.partialOpenRecoveryRatio
       ) {
         partialOpening = true;
-        partialOpeningStrength = clamp01(drop / 0.4);
+        partialOpeningStrength = clamp01(drop / 0.16);
         state.inDip = false;
         state.dipStartMs = null;
         state.baselineCurl = Math.max(totalCurl, state.dipBaselineCurl * 0.9);

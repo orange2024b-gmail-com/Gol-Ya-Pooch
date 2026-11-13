@@ -270,4 +270,55 @@ describe('Game FSM: 100% state & transition coverage', () => {
       transitionGameFsm({ ...inHide, state: 'HIDING' }, { type: 'TICK', dtMs: 20_000 }).state
     ).toBe('COMPUTER_GUESS');
   });
+
+  it('supports Phase 2 rule engine target score, AI guess payloads, and match winner lifecycle', () => {
+    let ctx = createInitialGameContext({ targetScore: 2 });
+    ctx = transitionGameFsm(ctx, { type: 'GO_PERMISSION' });
+    ctx = transitionGameFsm(ctx, { type: 'CAMERA_READY' });
+    ctx = transitionGameFsm(ctx, { type: 'CALIBRATION_COMPLETE' });
+    ctx = transitionGameFsm(ctx, { type: 'SET_TARGET_SCORE', targetScore: 2 });
+    expect(ctx.ruleSet.targetScore).toBe(2);
+
+    ctx = transitionGameFsm(ctx, { type: 'START_GAME' });
+    ctx = transitionGameFsm(ctx, { type: 'PINCH_CONFIRMED', side: 'LEFT' });
+    ctx = transitionGameFsm(ctx, {
+      type: 'FINISH_HIDING',
+      aiGuess: {
+        guess: 'RIGHT',
+        probability: 0.84,
+        explanationFa: 'در ثانیه ۳.۲ دست‌ها به هم رسیدند.',
+        timelineEvents: ['ثانیه ۳.۲: دست‌ها به هم رسیدند'],
+      },
+    });
+    expect(ctx.state).toBe('COMPUTER_GUESS');
+    expect(ctx.computerGuess).toBe('RIGHT');
+    expect(ctx.computerGuessProb).toBeCloseTo(0.84, 4);
+    expect(ctx.explanationFa).toContain('۳.۲');
+
+    ctx = transitionGameFsm(ctx, { type: 'PROCEED_TO_REVEAL' });
+    ctx = transitionGameFsm(ctx, { type: 'REVEAL_VERIFIED', outcome: 'RIGHT' });
+    expect(ctx.state).toBe('ROUND_RESULT');
+    expect(ctx.computerScore).toBe(1);
+    expect(ctx.matchWinner).toBeNull();
+    expect(ctx.ruleHiderOwner).toBe('COMPUTER');
+
+    // Second round: computer wins again and reaches targetScore=2
+    ctx = transitionGameFsm(ctx, { type: 'NEXT_ROUND' });
+    ctx = transitionGameFsm(ctx, { type: 'PINCH_CONFIRMED', side: 'LEFT' });
+    ctx = transitionGameFsm(ctx, {
+      type: 'FINISH_HIDING',
+      aiGuess: { guess: 'LEFT', probability: 0.91, explanationFa: 'بدون تماس باقی ماند.' },
+    });
+    ctx = transitionGameFsm(ctx, { type: 'PROCEED_TO_REVEAL' });
+    ctx = transitionGameFsm(ctx, { type: 'REVEAL_VERIFIED', outcome: 'LEFT' });
+    expect(ctx.computerScore).toBe(2);
+    expect(ctx.matchWinner).toBe('COMPUTER');
+
+    // NEXT_ROUND after match completion starts a fresh match
+    ctx = transitionGameFsm(ctx, { type: 'NEXT_ROUND' });
+    expect(ctx.state).toBe('SHOW_GOL');
+    expect(ctx.computerScore).toBe(0);
+    expect(ctx.humanScore).toBe(0);
+    expect(ctx.matchWinner).toBeNull();
+  });
 });

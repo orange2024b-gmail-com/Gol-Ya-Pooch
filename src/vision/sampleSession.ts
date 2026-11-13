@@ -228,14 +228,29 @@ export function createPhase2TransferSampleSession(): RecordedSession {
     }
 
     const leftHalfOpen = f >= 44 && f <= 48;
+    const rawLeft = makeQuickPose({ x: lx, y: 0.68 }, leftHalfOpen ? 'half-open' : 'fist');
+    const rawRight = makeQuickPose({ x: rx, y: 0.68 }, 'fist', true);
+    // After handover (f > 48), receiver (RIGHT) holds slightly tighter than empty LEFT
+    const rightLms =
+      f > 48
+        ? rawRight.map((lm, idx) =>
+            idx === 0 || idx === 1 || idx === 5 || idx === 9 || idx === 13 || idx === 17
+              ? lm
+              : {
+                  ...lm,
+                  x: rawRight[9]!.x + (lm.x - rawRight[9]!.x) * 0.86,
+                  y: rawRight[9]!.y + (lm.y - rawRight[9]!.y) * 0.86,
+                }
+          )
+        : rawRight;
     const rawDetections = [
       {
-        landmarks: makeQuickPose({ x: lx, y: 0.68 }, leftHalfOpen ? 'half-open' : 'fist'),
+        landmarks: rawLeft,
         handedness: 'LEFT' as const,
         handednessScore: 0.92,
       },
       {
-        landmarks: makeQuickPose({ x: rx, y: 0.68 }, 'fist', true),
+        landmarks: rightLms,
         handedness: 'RIGHT' as const,
         handednessScore: 0.92,
       },

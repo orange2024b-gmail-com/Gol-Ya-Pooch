@@ -189,6 +189,7 @@ export class GolYaPoochApp {
 
     this.overlayCanvas = document.createElement('canvas');
     this.overlayCanvas.className = 'camera-overlay';
+    this.overlayCanvas.dir = 'ltr';
     const oCtx = this.overlayCanvas.getContext('2d');
     if (!oCtx) throw new Error('2D canvas context unavailable');
     this.overlayCtx = oCtx;
@@ -1493,6 +1494,7 @@ export class GolYaPoochApp {
 
     const chartCanvas = document.createElement('canvas');
     chartCanvas.className = 'debug-belief-canvas';
+    chartCanvas.dir = 'ltr';
     chartCanvas.width = 560;
     chartCanvas.height = 120;
     chartCanvas.setAttribute('data-testid', 'debug-belief-chart');
